@@ -1,8 +1,21 @@
 @import "tailwindcss";
 
+/*
+ * OneDash theme
+ * A dark, modern, "developer tool" aesthetic.
+ * Colors: deep slate background, electric green accent (the "operational" signal),
+ *         soft white text.
+ */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #0a0e1a;
+  --background-elevated: #111827;
+  --foreground: #e6edf3;
+  --foreground-muted: #8b95a7;
+  --accent: #10d97e;
+  --accent-dim: #0f9d5e;
+  --border: #1f2937;
+  --danger: #ef4444;
 }
 
 @theme inline {
@@ -12,15 +25,18 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+}
+
+/* Subtle dotted grid background — gives the "dashboard" feel */
+.grid-bg {
+  background-image: radial-gradient(
+    circle,
+    rgba(139, 149, 167, 0.08) 1px,
+    transparent 1px
+  );
+  background-size: 24px 24px;
 }
