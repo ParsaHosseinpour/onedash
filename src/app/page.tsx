@@ -1,4 +1,5 @@
 import Link from "next/link";
+import WaitlistForm from "./components/WaitlistForm";
 
 /**
  * OneDash — Landing Page (v0.1)
@@ -221,25 +222,7 @@ export default function Home() {
             in early — plus a free Pro upgrade for the first 100 signups.
           </p>
 
-          <form className="mt-8 flex flex-col sm:flex-row gap-3 justify-center">
-            <input
-              type="email"
-              required
-              placeholder="you@example.com"
-              className="rounded-lg border border-[color:var(--border)] bg-[color:var(--background-elevated)] px-4 py-3 text-foreground placeholder:text-[color:var(--foreground-muted)] focus:outline-none focus:ring-2 focus:ring-[color:var(--accent)] flex-1 max-w-sm"
-            />
-            <button
-              type="submit"
-              className="rounded-lg bg-[color:var(--accent)] px-6 py-3 font-semibold text-[#0a0e1a] hover:bg-[color:var(--accent-dim)] transition-colors"
-            >
-              Reserve my spot
-            </button>
-          </form>
-
-          <p className="mt-4 text-xs text-[color:var(--foreground-muted)]">
-            ⚡ Note: this form is a placeholder for v0.1. It&apos;ll be wired up
-            to a real database in v0.2.
-          </p>
+          <WaitlistForm />
         </div>
       </section>
 
