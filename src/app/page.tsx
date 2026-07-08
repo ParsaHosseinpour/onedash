@@ -1,5 +1,6 @@
 import Link from "next/link";
 import WaitlistForm from "./components/WaitlistForm";
+import NavBar from "./components/NavBar";
 
 /**
  * OneDash — Landing Page (v0.1)
@@ -12,36 +13,9 @@ export default function Home() {
   return (
     <main className="flex-1">
       {/* ====================================================
-          NAV BAR
+          NAV BAR (smart — shows different buttons if logged in)
       ==================================================== */}
-      <nav className="border-b border-[color:var(--border)] backdrop-blur-sm">
-        <div className="mx-auto max-w-6xl px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Logo />
-            <span className="font-semibold tracking-tight">OneDash</span>
-          </div>
-          <div className="flex items-center gap-6 text-sm">
-            <Link
-              href="#features"
-              className="text-[color:var(--foreground-muted)] hover:text-[color:var(--foreground)] transition-colors"
-            >
-              Features
-            </Link>
-            <Link
-              href="#pricing"
-              className="text-[color:var(--foreground-muted)] hover:text-[color:var(--foreground)] transition-colors"
-            >
-              Pricing
-            </Link>
-            <Link
-              href="#waitlist"
-              className="rounded-lg bg-[color:var(--accent)] px-4 py-2 font-medium text-[#0a0e1a] hover:bg-[color:var(--accent-dim)] transition-colors"
-            >
-              Join waitlist
-            </Link>
-          </div>
-        </div>
-      </nav>
+      <NavBar />
 
       {/* ====================================================
           HERO
