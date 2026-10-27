@@ -1,35 +1,60 @@
 "use client";
 
-import { useState } from "react";
-import { supabase } from "@/lib/supabase-client";
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { signOutAction } from "@/app/actions/auth";
 
 /**
- * LogoutButton — signs the user out.
- *
- * Calls supabase.auth.signOut() which:
- *   1. Deletes the auth cookie (locally + tells Supabase to revoke the session)
- *   2. Returns to a logged-out state
- *
- * After sign out, we hard-refresh to "/" so the server re-renders without
- * the auth cookie, showing the public landing page.
+ * Logout is a server action: Supabase revokes the session and the SSR cookies
+ * are cleared on the response. The client then returns to the public site.
  */
 export default function LogoutButton() {
-  const [loading, setLoading] = useState(false);
+  const router = useRouter();
+  const [isPending, startTransition] = useTransition();
+  const [errorMessage, setErrorMessage] = useState("");
 
-  async function handleLogout() {
-    setLoading(true);
-    await supabase.auth.signOut();
-    // Hard refresh so server components re-evaluate auth state.
-    window.location.href = "/";
+  function handleLogout() {
+    setErrorMessage("");
+
+    startTransition(async () => {
+      try {
+        const result = await signOutAction();
+
+        if (!result.ok) {
+          setErrorMessage(
+            result.message ?? "We couldn't log you out. Please try again."
+          );
+          return;
+        }
+
+        router.replace("/");
+        router.refresh();
+      } catch {
+        setErrorMessage("We couldn't log you out. Please try again.");
+      }
+    });
   }
 
   return (
-    <button
-      onClick={handleLogout}
-      disabled={loading}
-      className="text-sm rounded-lg border border-[color:var(--border)] px-4 py-2 hover:bg-[color:var(--background-elevated)] transition-colors disabled:opacity-50"
-    >
-      {loading ? "Logging out…" : "Log out"}
-    </button>
+    <div className="flex flex-col items-end gap-1">
+      <button
+        type="button"
+        onClick={handleLogout}
+        disabled={isPending}
+        className="text-sm rounded-lg border border-[color:var(--border)] px-4 py-2 hover:bg-[color:var(--background-elevated)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+      >
+        {isPending ? "Logging out…" : "Log out"}
+      </button>
+
+      {errorMessage && (
+        <p
+          role="alert"
+          aria-live="polite"
+          className="text-xs text-[color:var(--danger)]"
+        >
+          {errorMessage}
+        </p>
+      )}
+    </div>
   );
 }

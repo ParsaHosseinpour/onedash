@@ -1,7 +1,12 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import ConfigurationNotice from "@/app/components/ConfigurationNotice";
+import { isSupabaseConfigured } from "@/lib/env";
 import { createClient } from "@/lib/supabase/server";
 import SignupForm from "./SignupForm";
+
+// Never pre-render an auth page with build-time configuration.
+export const dynamic = "force-dynamic";
 
 /**
  * /signup page (server component).
@@ -10,10 +15,18 @@ import SignupForm from "./SignupForm";
  * Otherwise render the signup form (client component).
  */
 export default async function SignupPage() {
+  if (!isSupabaseConfigured()) {
+    return <ConfigurationNotice />;
+  }
+
   const supabase = await createClient();
 
-  const { data: { user } } = await supabase.auth.getUser();
-  if (user) {
+  const session = await supabase.auth.getUser().catch((error) => {
+    console.error("Could not check the existing session.", error);
+    return null;
+  });
+
+  if (session?.data?.user) {
     redirect("/dashboard");
   }
 

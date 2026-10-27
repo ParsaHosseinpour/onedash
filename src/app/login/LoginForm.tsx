@@ -1,48 +1,26 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
-import { supabase } from "@/lib/supabase-client";
+import { useActionState } from "react";
+import { signInAction } from "@/app/actions/auth";
+import { initialLoginState } from "@/lib/auth-validation";
 
 /**
- * LoginForm — interactive client component.
- *
- * Handles the actual login: takes email/password, calls Supabase Auth,
- * shows loading + error states.
- *
- * On success: redirects to /dashboard (server will detect the new session).
+ * Login form. Credentials are submitted to a server action so the Supabase
+ * session cookies are written by the server and remain readable by the
+ * dashboard on the very next request.
  */
-export default function LoginForm() {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [status, setStatus] = useState<"idle" | "loading" | "error">("idle");
-  const [errorMessage, setErrorMessage] = useState("");
+export default function LoginForm({ nextPath }: { nextPath: string }) {
+  const [state, formAction, isPending] = useActionState(
+    signInAction,
+    initialLoginState
+  );
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setStatus("loading");
-    setErrorMessage("");
-
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-
-    if (error) {
-      setStatus("error");
-      setErrorMessage(
-        error.message === "Invalid login credentials"
-          ? "Wrong email or password. Try again."
-          : error.message
-      );
-      return;
-    }
-
-    // Success — hard refresh so the server picks up the new auth cookie.
-    window.location.href = "/dashboard";
-  }
+  const errorMessage = state.status === "error" ? state.message : null;
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
+    <form action={formAction} className="space-y-4">
+      <input type="hidden" name="next" value={nextPath} />
+
       <div>
         <label
           htmlFor="email"
@@ -52,12 +30,15 @@ export default function LoginForm() {
         </label>
         <input
           id="email"
+          name="email"
           type="email"
           required
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          disabled={status === "loading"}
+          autoComplete="email"
+          defaultValue={state.status === "error" ? state.email ?? "" : ""}
+          disabled={isPending}
           placeholder="you@example.com"
+          aria-invalid={Boolean(errorMessage)}
+          aria-describedby={errorMessage ? "login-error" : undefined}
           className="w-full rounded-lg border border-[color:var(--border)] bg-[color:var(--background-elevated)] px-4 py-2.5 text-foreground placeholder:text-[color:var(--foreground-muted)] focus:outline-none focus:ring-2 focus:ring-[color:var(--accent)] disabled:opacity-50"
         />
       </div>
@@ -71,26 +52,35 @@ export default function LoginForm() {
         </label>
         <input
           id="password"
+          name="password"
           type="password"
           required
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          disabled={status === "loading"}
+          autoComplete="current-password"
+          disabled={isPending}
           placeholder="••••••••"
+          aria-invalid={Boolean(errorMessage)}
+          aria-describedby={errorMessage ? "login-error" : undefined}
           className="w-full rounded-lg border border-[color:var(--border)] bg-[color:var(--background-elevated)] px-4 py-2.5 text-foreground placeholder:text-[color:var(--foreground-muted)] focus:outline-none focus:ring-2 focus:ring-[color:var(--accent)] disabled:opacity-50"
         />
       </div>
 
-      {status === "error" && (
-        <p className="text-sm text-[color:var(--danger)]">{errorMessage}</p>
+      {errorMessage && (
+        <p
+          id="login-error"
+          role="alert"
+          aria-live="polite"
+          className="text-sm text-[color:var(--danger)]"
+        >
+          {errorMessage}
+        </p>
       )}
 
       <button
         type="submit"
-        disabled={status === "loading"}
+        disabled={isPending}
         className="w-full rounded-lg bg-[color:var(--accent)] px-4 py-2.5 font-semibold text-[#0a0e1a] hover:bg-[color:var(--accent-dim)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
       >
-        {status === "loading" ? "Logging in…" : "Log in"}
+        {isPending ? "Logging in…" : "Log in"}
       </button>
     </form>
   );

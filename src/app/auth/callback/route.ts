@@ -1,36 +1,66 @@
 import { NextResponse } from "next/server";
+import { sanitizeNextPath } from "@/lib/auth-validation";
+import { ConfigurationError, getSiteUrl } from "@/lib/env";
 import { createClient } from "@/lib/supabase/server";
 
 /**
- * Auth callback route — handles the link users click in their confirmation email.
+ * Handles the link in the Supabase confirmation email.
  *
- * THE EMAIL CONFIRMATION FLOW:
- *   1. User signs up at /signup
- *   2. Supabase sends them an email with a link
- *   3. They click the link
- *   4. The link brings them here (/auth/callback?code=...)
- *   5. We exchange the code for a session
- *   6. We redirect them to /dashboard (they're now logged in!)
- *
- * This is the standard OAuth-style flow. The "code" in the URL is a one-time
- * secret that proves "yes, this email is really theirs."
+ * The redirect origin comes from NEXT_PUBLIC_SITE_URL, never from the incoming
+ * Host header. The `next` path is restricted to an allowlist.
  */
 export async function GET(request: Request) {
   const requestUrl = new URL(request.url);
-  const code = requestUrl.searchParams.get("code");
-  const origin = requestUrl.origin;
 
-  if (code) {
+  let siteUrl: string;
+  try {
+    siteUrl = getSiteUrl();
+  } catch (error) {
+    if (error instanceof ConfigurationError) {
+      console.error("Auth callback is unavailable.", error.message);
+    } else {
+      console.error("Could not determine the canonical site URL.", error);
+    }
+
+    return NextResponse.json(
+      { error: "Authentication is not configured on this deployment." },
+      { status: 503 }
+    );
+  }
+
+  const code = requestUrl.searchParams.get("code");
+  const nextPath = sanitizeNextPath(requestUrl.searchParams.get("next"));
+
+  if (!code) {
+    return NextResponse.redirect(
+      new URL("/login?error=auth_callback_failed", siteUrl)
+    );
+  }
+
+  try {
     const supabase = await createClient();
     const { error } = await supabase.auth.exchangeCodeForSession(code);
 
-    if (!error) {
-      // Success! Send them to the dashboard.
-      return NextResponse.redirect(`${origin}/dashboard`);
+    if (error) {
+      console.error("Auth code exchange failed.", { code: error.code });
+      return NextResponse.redirect(
+        new URL("/login?error=auth_callback_failed", siteUrl)
+      );
     }
+  } catch (error) {
+    if (error instanceof ConfigurationError) {
+      console.error("Auth callback is unavailable.", error.message);
+      return NextResponse.json(
+        { error: "Authentication is not configured on this deployment." },
+        { status: 503 }
+      );
+    }
+
+    console.error("Auth callback threw unexpectedly.", error);
+    return NextResponse.redirect(
+      new URL("/login?error=auth_callback_failed", siteUrl)
+    );
   }
 
-  // If something went wrong (expired code, tampered link), send to login
-  // with an error message we can display.
-  return NextResponse.redirect(`${origin}/login?error=auth_callback_failed`);
+  return NextResponse.redirect(new URL(nextPath, siteUrl));
 }

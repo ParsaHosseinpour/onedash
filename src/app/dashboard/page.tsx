@@ -1,7 +1,9 @@
 import Link from "next/link";
-import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth";
 import LogoutButton from "./LogoutButton";
+
+// The dashboard depends on request cookies and must never be prerendered.
+export const dynamic = "force-dynamic";
 
 /**
  * /dashboard — the protected user dashboard.
@@ -20,16 +22,9 @@ import LogoutButton from "./LogoutButton";
  * it's a placeholder that confirms auth works end-to-end.
  */
 export default async function DashboardPage() {
-  const supabase = await createClient();
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  // 🔒 PROTECTION: Not logged in → bounce to login.
-  if (!user) {
-    redirect("/login");
-  }
+  // 🔒 AUTHORITATIVE CHECK: verifies the session with Supabase Auth. Proxy
+  // redirects are only an optimistic optimization and are not trusted here.
+  const user = await requireUser();
 
   return (
     <main className="flex-1">

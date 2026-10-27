@@ -2,37 +2,68 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { supabase } from "@/lib/supabase-client";
+import { isSupabaseConfigured } from "@/lib/env";
+import { getSupabaseBrowserClient } from "@/lib/supabase-client";
 
 /**
- * NavBar — the marketing site navigation bar.
+ * Marketing navigation.
  *
- * Smart feature: it shows DIFFERENT buttons based on login state.
- *   - Logged out: "Log in" + "Join waitlist"
- *   - Logged in:  "Dashboard" + "Log out"
- *
- * Because auth state lives in the browser (cookie + Supabase session),
- * we use a client component + useEffect + onAuthStateChange to react
- * to login/logout in real time.
+ * Auth state is read from the same cookie-based Supabase session the server
+ * uses. `getUser()` validates with the Auth server rather than trusting a
+ * cached JWT. If Supabase is not configured, the page still renders and the
+ * navigation stays in its logged-out state.
  */
 export default function NavBar() {
   const [loggedIn, setLoggedIn] = useState(false);
 
   useEffect(() => {
-    // Check current auth state on mount
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setLoggedIn(!!session);
-    });
+    if (!isSupabaseConfigured()) {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn(
+          "Supabase is not configured; the navigation will show the logged-out state."
+        );
+      }
+      return;
+    }
 
-    // Subscribe to future auth changes (login, logout, token refresh)
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      setLoggedIn(!!session);
-    });
+    let active = true;
+    let subscription: { unsubscribe: () => void } | undefined;
 
-    // Cleanup subscription when component unmounts
-    return () => subscription.unsubscribe();
+    try {
+      const supabase = getSupabaseBrowserClient();
+
+      supabase.auth
+        .getUser()
+        .then(({ data }) => {
+          if (active) {
+            setLoggedIn(Boolean(data.user));
+          }
+        })
+        .catch(() => {
+          if (active) {
+            setLoggedIn(false);
+          }
+        });
+
+      const { data } = supabase.auth.onAuthStateChange(
+        (_event, session) => {
+          if (active) {
+            setLoggedIn(Boolean(session));
+          }
+        }
+      );
+
+      subscription = data.subscription;
+    } catch (error) {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn("Could not initialize the Supabase browser client.", error);
+      }
+    }
+
+    return () => {
+      active = false;
+      subscription?.unsubscribe();
+    };
   }, []);
 
   return (
