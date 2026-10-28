@@ -1,10 +1,31 @@
 # OneDash Roadmap
 
-**Status:** Phase 0 audit complete — 2026-10-26
+**Status:** Phase 2 database foundation implemented and verified on `phase-2/database-foundation` — 2026-10-28. Schema, RLS, and migrations pass all checks; three Phase 2 criteria remain partial or deviated. The Phase 1 browser/cookie flow now passes manually against the local stack; automated Playwright E2E is still missing.
 **First release scope:** real HTTP/HTTPS uptime monitoring
-**Phase 0 rule:** audit only. No application behavior, SQL schema, dependency, or deployment configuration was changed.
+**Phase 0 rule (historical):** audit only. No application behavior, SQL schema, dependency, or deployment configuration was changed.
+**Phase 2 rule:** database foundation only. No monitor UI, scheduler, checker, alert sender, deployment, or remote `db push` was added.
 
-OneDash is currently a Next.js marketing site with a Supabase waitlist and an authentication scaffold. It is **not yet an uptime monitor**. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
+OneDash is currently a Next.js marketing site with a Supabase waitlist, a cookie-based auth foundation, and a versioned tenant-safe database schema. It is **not yet an uptime monitor**. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
+
+## Verification snapshot (2026-10-28)
+
+Phase 2 was verified on a fresh local database with Supabase CLI 2.122.0, Docker Desktop, and Node 24.
+
+| Check | Command | Actual result |
+|---|---|---|
+| Lint | `npm run lint` | Pass, no findings |
+| Type check | `npm run typecheck` | Pass |
+| Unit/integration tests | `npm test` | Pass: 11 files, 72 tests |
+| Production build (no Supabase env) | `npm run build` | Pass; no `middleware` deprecation warning |
+| Runtime dependency audit | `npm audit --omit=dev` | 0 vulnerabilities |
+| Migrations from empty | `npm run db:reset` | Pass: 5 migrations + seed |
+| Database/RLS tests | `npm run db:test` | Pass: 4 files, 150 assertions |
+| Database lint | `npm run db:lint` | Pass: no schema errors |
+| Security headers | `npm start` + HTTP request | `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy`, HSTS present; no `X-Powered-By` |
+| Client-bundle secret scan | Search `.next/static` | No `SUPABASE_SERVICE_ROLE_KEY` or `service_role` references |
+| Browser auth E2E | Manual Chrome flow: signup → Mailpit confirmation → callback → dashboard → refresh → logout → login | **Pass** (manual, 2026-10-28); not automated in CI |
+
+Manual browser evidence (2026-10-28): a new local user was created, confirmed through Mailpit, and landed on `/dashboard`. Refreshing kept the session. Logout cleared all auth cookies and redirected to the landing page; `/dashboard` then redirected to `/login`. Logging in again worked, and `/login` and `/signup` both redirected an authenticated user to `/dashboard`. `localStorage` stayed empty throughout; auth cookies were present while signed in and absent after logout.
 
 ---
 
@@ -37,6 +58,8 @@ OneDash is currently a Next.js marketing site with a Supabase waitlist and an au
 ---
 
 ## 2. Repository state
+
+> **Historical baseline:** Sections 2–5 describe the Phase 0 audit snapshot from 2026-10-26 and are intentionally preserved. They no longer describe the current branch; see the verification snapshot above and the Phase 1/2 status below.
 
 | Item | Finding |
 |---|---|
@@ -444,20 +467,22 @@ Phases 1–7 are the first-release path. Phase 8 is post-launch expansion. Phase
 
 **Acceptance criteria**
 
-- [ ] In a clean browser against a real/local Supabase project: signup → confirmation email → callback → dashboard → logout all work.
-- [ ] Password login creates server-readable cookies; no Supabase auth key is stored in `localStorage`.
-- [ ] Logout clears cookies and redirects to a logged-out page; a back-button revisit of `/dashboard` redirects to `/login`.
-- [ ] Logged-out `/dashboard` redirects to `/login`; logged-in `/login` and `/signup` redirect to `/dashboard`.
-- [ ] NavBar, server components, proxy, and logout agree on auth state.
-- [ ] `npm run lint`, unit tests, auth E2E, and `npm run build` pass in CI with documented env values.
-- [ ] `npm audit --omit=dev` has no critical or high runtime vulnerabilities; any remaining dev-only advisories are documented and tracked.
-- [ ] The `middleware` deprecation warning is gone.
-- [ ] Missing env values produce one clear, actionable error, not a prerender stack.
-- [ ] Security headers are present on HTML responses.
-- [ ] No service-role key or other server secret is present in the client bundle.
-- [ ] README explains local Supabase, env vars, migrations, and verification commands.
+- [x] In a clean browser against the local Supabase project: signup → confirmation email → callback → dashboard → logout all work. Verified manually on 2026-10-28 (see the verification snapshot).
+- [x] Password login creates server-readable cookies; no Supabase auth key is stored in `localStorage`. Verified in the browser: auth cookies were present while signed in and `localStorage` was empty.
+- [x] Logout clears cookies and redirects to a logged-out page; a revisit of `/dashboard` redirects to `/login`. Verified in the browser.
+- [x] Logged-out `/dashboard` redirects to `/login`; logged-in `/login` and `/signup` redirect to `/dashboard`. Verified in the browser.
+- [x] NavBar, server components, proxy, and logout agree on auth state. Verified in the browser while signed in, after refresh, and after logout.
+- [ ] **PARTIAL.** `npm run lint`, unit tests, and `npm run build` pass in CI, and the manual browser E2E passed; an automated Playwright auth E2E suite is still not implemented, so the CI criterion is not fully met.
+- [x] `npm audit --omit=dev` reports 0 vulnerabilities (2026-10-28).
+- [x] The `middleware` deprecation warning is gone; the build output shows `ƒ Proxy (Middleware)` with no warning.
+- [x] Missing env values produce one clear, actionable error, not a prerender stack. Covered by unit tests; the landing page builds without Supabase env.
+- [x] Security headers are present on HTML responses. Verified with `npm start` plus an HTTP request (see the verification snapshot).
+- [x] No service-role key or other server secret is present in the client bundle. No `SUPABASE_SERVICE_ROLE_KEY` or `service_role` references were found in `.next/static`.
+- [x] README explains local Supabase, env vars, migrations, and verification commands.
 
-**Exit gate:** auth is trustworthy and the baseline is testable. No monitoring work should be exposed to users before this gate.
+**Exit gate: met for manual verification.** The cookie-based auth flow is usable and was verified in a browser. Automated Playwright E2E remains open, so the CI acceptance criterion is only partially met.
+
+**Known Phase 1 gaps (not changed by Phase 2):** Playwright auth E2E was not added; the landing page still contains the hard-coded "All systems operational" pill and unbuilt ping/TCP/cron, multi-region, and status-page claims; version labels remain `v0.1`. These are tracked by Phase 1 work items 12–13 and Phase 7.
 
 ---
 
@@ -479,20 +504,24 @@ Phases 1–7 are the first-release path. Phase 8 is post-launch expansion. Phase
 
 **Acceptance criteria**
 
-- [ ] `supabase db reset` applies every migration from an empty database without manual SQL.
-- [ ] Seed data and a documented local setup work on a fresh clone.
-- [ ] Every tenant table has RLS enabled and a test proving cross-tenant access is denied.
-- [ ] Anonymous users cannot read monitors, checks, incidents, alert channels, deliveries, or secrets.
-- [ ] A published status page exposes only its published monitors and public fields; private monitors do not leak.
-- [ ] An owner/admin can manage organization resources; a viewer cannot mutate them.
-- [ ] Check-result idempotency is enforced by a unique constraint.
-- [ ] Only one open incident per monitor is possible.
-- [ ] Active-monitor schedule queries have supporting indexes.
-- [ ] The worker role can ingest results and update state, but cannot manage users or read unrelated tenants.
-- [ ] Waitlist rows reject oversized/invalid emails and duplicate case variants; anonymous insert abuse is rate-limited.
-- [ ] Backup/retention expectations are documented; raw-result partitioning and rollup strategy are agreed.
+- [x] `supabase db reset` applies every migration from an empty database without manual SQL. Verified: 5 migrations + seed.
+- [x] Seed data and a documented local setup work on a fresh clone. Verified locally; CI runs reset and the database suite.
+- [x] Every tenant table has RLS enabled and a test proving cross-tenant access is denied. 150 pgTAP assertions pass.
+- [x] Anonymous users cannot read monitors, checks, incidents, alert channels, deliveries, or secrets.
+- [x] A published status page exposes only its published monitors and public fields; private monitors do not leak.
+- [x] An owner/admin can manage organization resources; a viewer cannot mutate them.
+- [x] Check-result idempotency is enforced by a unique constraint.
+- [x] Only one open incident per monitor is possible.
+- [x] Active-monitor schedule queries have supporting indexes.
+- [ ] **DEVIATION — not met as written.** The worker role can ingest results and update state, and cannot manage users, but it can read monitoring/alerting rows for all tenants. This is intentional for a global scheduler and is documented in `docs/database.md`; it needs explicit approval or a per-tenant worker redesign before Phase 4.
+- [ ] **PARTIAL.** Waitlist rows reject oversized/invalid emails and duplicate case variants (verified by pgTAP), and anonymous direct inserts are closed. Rate limiting remains in-process and per instance, not shared or WAF-backed, so abuse protection is not fully met.
+- [ ] **PARTIAL.** Backup/retention expectations and a partition/rollup plan are documented, but `check_results` is not partitioned, no rollups exist, and the raw-retention window is still an open product decision.
 
-**Exit gate:** a fresh database is reproducible and cross-tenant isolation is proven by tests.
+**Exit gate:** met for schema reproducibility and tested cross-tenant isolation. The worker-role deviation, per-instance waitlist limiter, and unimplemented partitioning/rollups are explicitly open and must be resolved or accepted before Phase 4.
+
+**Phase 2 delivered:** five versioned migrations, a two-organization seed, 150 passing pgTAP assertions, `docs/database.md` (ERD, role matrix, RLS helpers, worker role, retention plan), a database CI job, and Supabase CLI scripts.
+
+**Phase 2 deferred:** `check_results` partitioning and rollups, a shared waitlist limiter, per-tenant worker isolation, remote Supabase deployment, monitor CRUD UI, and the scheduler/checker (Phase 3/4).
 
 ---
 
