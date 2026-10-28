@@ -1,6 +1,7 @@
+import "@/lib/server-guard";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { normalizeEmail } from "@/lib/email";
-import { ConfigurationError, getSupabasePublicEnv } from "@/lib/env";
+import { ConfigurationError, getSupabaseServiceRoleEnv } from "@/lib/env";
 import {
   checkRateLimit,
   type RateLimitDecision,
@@ -79,8 +80,8 @@ let waitlistClient: SupabaseClient | undefined;
 
 function getWaitlistClient(): SupabaseClient {
   if (!waitlistClient) {
-    const { url, anonKey } = getSupabasePublicEnv();
-    waitlistClient = createClient(url, anonKey, {
+    const { url, serviceRoleKey } = getSupabaseServiceRoleEnv();
+    waitlistClient = createClient(url, serviceRoleKey, {
       auth: {
         persistSession: false,
         autoRefreshToken: false,
@@ -93,9 +94,10 @@ function getWaitlistClient(): SupabaseClient {
 }
 
 /**
- * The waitlist uses the public anon key, not a service-role key. RLS on the
- * waitlist table permits inserts only. This keeps the server route free of
- * secrets while still centralizing validation and rate limiting.
+ * The waitlist write path uses the server-only service-role key because anon
+ * no longer has INSERT on the waitlist table. This closes the direct PostgREST
+ * insert bypass; the route still validates, normalizes, and rate-limits before
+ * calling this inserter.
  */
 export function createWaitlistInserter(): WaitlistInserter {
   return async (row) => {

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ConfigurationError } from "@/lib/env";
 import type { RateLimitDecision } from "@/lib/rate-limit";
 import {
+  createWaitlistInserter,
   submitWaitlist,
   WAITLIST_MESSAGES,
 } from "@/lib/waitlist-service";
@@ -138,6 +139,20 @@ describe("submitWaitlist", () => {
       status: "unavailable",
       message: WAITLIST_MESSAGES.unavailable,
     });
+  });
+
+  it("fails closed when the server-only service role is not configured", async () => {
+    vi.stubEnv(
+      "NEXT_PUBLIC_SUPABASE_URL",
+      "https://example.supabase.co"
+    );
+    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "");
+
+    const insertRow = createWaitlistInserter();
+
+    await expect(
+      insertRow({ email: "person@example.com", source: "landing_page" })
+    ).rejects.toBeInstanceOf(ConfigurationError);
   });
 
   it("hides unexpected insert exceptions behind a generic message", async () => {

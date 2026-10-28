@@ -18,6 +18,11 @@ export type SupabasePublicEnv = {
   anonKey: string;
 };
 
+export type SupabaseServiceRoleEnv = {
+  url: string;
+  serviceRoleKey: string;
+};
+
 function requiredValue(name: string, value: string | undefined): string {
   const trimmed = value?.trim();
   if (!trimmed) {
@@ -73,6 +78,31 @@ export function getSupabasePublicEnv(): SupabasePublicEnv {
   return {
     url: withoutTrailingSlash(url.toString()),
     anonKey,
+  };
+}
+
+/**
+ * Read the server-only service-role configuration.
+ *
+ * The service-role key bypasses RLS. It must only be used in trusted server
+ * code (currently the waitlist write path) and must never be prefixed with
+ * NEXT_PUBLIC_, logged, returned to a client, or committed to Git.
+ */
+export function getSupabaseServiceRoleEnv(): SupabaseServiceRoleEnv {
+  const rawUrl = requiredValue(
+    "NEXT_PUBLIC_SUPABASE_URL",
+    process.env.NEXT_PUBLIC_SUPABASE_URL
+  );
+  const serviceRoleKey = requiredValue(
+    "SUPABASE_SERVICE_ROLE_KEY",
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+
+  const url = parseHttpUrl("NEXT_PUBLIC_SUPABASE_URL", rawUrl);
+
+  return {
+    url: withoutTrailingSlash(url.toString()),
+    serviceRoleKey,
   };
 }
 

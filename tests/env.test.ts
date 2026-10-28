@@ -3,6 +3,7 @@ import {
   ConfigurationError,
   getSiteUrl,
   getSupabasePublicEnv,
+  getSupabaseServiceRoleEnv,
   isSupabaseConfigured,
 } from "@/lib/env";
 
@@ -44,6 +45,43 @@ describe("getSupabasePublicEnv", () => {
       "https://user:pass@example.com"
     );
     expect(() => getSupabasePublicEnv()).toThrow(/credentials/);
+  });
+});
+
+describe("getSupabaseServiceRoleEnv", () => {
+  it("requires a server-only service-role key", () => {
+    vi.stubEnv(
+      "NEXT_PUBLIC_SUPABASE_URL",
+      "https://example.supabase.co"
+    );
+    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "");
+
+    expect(() => getSupabaseServiceRoleEnv()).toThrowError(
+      ConfigurationError
+    );
+    expect(() => getSupabaseServiceRoleEnv()).toThrow(
+      /SUPABASE_SERVICE_ROLE_KEY/
+    );
+  });
+
+  it("reads and normalizes the service-role configuration", () => {
+    vi.stubEnv(
+      "NEXT_PUBLIC_SUPABASE_URL",
+      "https://example.supabase.co/"
+    );
+    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "  service-role-key  ");
+
+    expect(getSupabaseServiceRoleEnv()).toEqual({
+      url: "https://example.supabase.co",
+      serviceRoleKey: "service-role-key",
+    });
+  });
+
+  it("rejects a malformed project URL", () => {
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "not-a-url");
+    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "service-role-key");
+
+    expect(() => getSupabaseServiceRoleEnv()).toThrow(/valid http/);
   });
 });
 
