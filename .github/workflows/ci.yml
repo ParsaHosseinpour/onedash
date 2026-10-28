@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - "phase-1/**"
+      - "phase-2/**"
   pull_request:
 
 permissions:
@@ -46,3 +47,33 @@ jobs:
 
       - name: Audit production dependencies
         run: npm audit --omit=dev
+
+  database:
+    name: Database migrations, RLS tests, and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.122.0
+
+      - name: Start local Supabase
+        run: supabase start
+
+      - name: Reset database from migrations and seed
+        run: supabase db reset
+
+      - name: Run pgTAP database tests
+        run: supabase test db --local
+
+      - name: Lint database functions
+        run: supabase db lint --local --level warning
+
+      - name: Stop local Supabase
+        if: always()
+        run: supabase stop --no-backup
