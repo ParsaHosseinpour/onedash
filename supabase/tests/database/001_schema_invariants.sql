@@ -32,6 +32,7 @@ select is(
         'status_page_monitors',
         'audit_logs',
         'monitor_request_secrets',
+        'monitor_limit_settings',
         'waitlist'
       )
       and not c.relrowsecurity

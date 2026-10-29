@@ -1,21 +1,25 @@
 # Database foundation
 
-This document describes the Phase 2 database model, migration workflow, RLS
-rules, worker role, and known gaps. It reflects the code on
-`phase-2/database-foundation`; it is not a claim that the schema has been
+This document describes the Phase 2 database model, the Phase 3 monitor
+configuration and development limit, the migration workflow, RLS rules, worker
+role, and known gaps. It reflects the code on
+`phase-3/monitor-management`; it is not a claim that the schema has been
 deployed to a hosted Supabase project.
 
 ## Status
 
-- Five versioned migrations live in `supabase/migrations/`.
+- Six versioned migrations live in `supabase/migrations/`.
 - `supabase db reset` applies all migrations and `supabase/seed.sql` from an
   empty local database.
-- `supabase test db --local` runs 150 pgTAP assertions; all pass on a fresh
+- `supabase test db --local` runs 188 pgTAP assertions; all pass on a fresh
   reset.
 - `supabase db lint --local` reports no schema errors.
 - `supabase/schema.sql` is retained as the Phase 1 historical file. The
   migrations supersede it. Do not apply `schema.sql` after the migrations.
-- No remote project has been linked or pushed. Phase 3 has not started.
+- Phase 3 adds the monitor management control plane and a database-enforced
+  development monitor limit. It does not add a scheduler or checker, and no
+  outbound customer request is made.
+- No remote project has been linked or pushed. Phase 4 has not started.
 
 The Phase 1 `schema.sql` and the waitlist migration agree on the table shape,
 constraints, case-insensitive unique index, and `waitlist_count()` definition.
@@ -81,6 +85,9 @@ channels, encrypted placeholder secrets, and an alert delivery.
 5. `20261028220000_revoke_default_table_privileges.sql` — removes Supabase's
    default TRUNCATE/REFERENCES/TRIGGER/MAINTAIN grants from anon/authenticated
    and updates default privileges for future objects.
+6. `20261028230000_monitor_limit.sql` — protected development-limit settings,
+   the `monitor_limit_per_org()` read function, and the concurrency-safe
+   `BEFORE INSERT` limit trigger.
 
 ## Entity relationship diagram
 
@@ -114,6 +121,12 @@ erDiagram
 
 `auth.users` is managed by Supabase Auth. `profiles` and all tenant tables
 reference it but are owned by the application schema.
+
+`monitor_limit_settings` is an operator-only singleton table and is intentionally
+not part of the tenant ERD. It stores the development limit and has no
+anon/authenticated grants or policies; app roles read it only through
+`monitor_limit_per_org()`. See [Monitor configuration and development
+limit](#monitor-configuration-and-development-limit).
 
 ## Tenant model
 
@@ -162,6 +175,8 @@ boundary; table grants are intentionally narrower than the policies.
 | Read encrypted request/alert secrets | no | no | no | no | yes |
 | Insert waitlist rows | service role only | service role only | service role only | service role only | no |
 | Read public published status pages | anon + authenticated | anon + authenticated | anon + authenticated | anon + authenticated | no |
+| Read effective monitor limit (`monitor_limit_per_org`) | yes | yes | yes | yes | no |
+| Change monitor limit settings | operator SQL only | operator SQL only | operator SQL only | operator SQL only | operator SQL only |
 
 The worker role is a global scheduler role. It can read monitoring and
 alerting rows for all tenants, but it has no access to profiles,
@@ -260,6 +275,86 @@ WAF is required before a multi-instance public launch.
 - The seed inserts confirmed users, which fires the trigger, then renames the
   two owner organizations and adds the remaining memberships.
 
+## Monitor configuration and development limit
+
+Phase 3 adds no tenant tables. It reuses the Phase 2 `monitors` and
+`monitor_state` tables and adds one operator-only settings table plus one
+trigger.
+
+### Application access
+
+- Monitor Server Actions use the cookie-scoped Supabase client and RLS. They do
+  not use the service-role key.
+- `requireUser()` supplies the authenticated user id. The server resolves the
+  user's oldest membership to determine the organization and role; no
+  organization id, role, user id, ownership flag, or limit is accepted from the
+  browser.
+- Owners, admins, and members can write. Viewers are read-only. RLS and the
+  Phase 2 policies remain the final authorization boundary.
+- Create/update input is validated on the server: name length, absolute
+  HTTP/HTTPS URL, no embedded credentials, ports 80/443, `GET`/`HEAD`, expected
+  status codes (single/list/range, max 20), interval 60–86,400 seconds, and
+  timeout 1–60 seconds shorter than the interval. Obvious localhost/private
+  targets are rejected at configuration time; full DNS/redirect SSRF
+  enforcement is Phase 4.
+- Deletion requires the exact monitor name. The server re-reads the name from
+  the database before deleting.
+- Repository selects name explicit safe columns:
+  `id,name,url,method,expected_status_codes,interval_seconds,timeout_seconds,is_active,created_at,updated_at`.
+  Scheduler fields, encrypted request secrets, ciphertext, and worker
+  credentials are not returned to the browser. `last_checked_at` comes only
+  from `monitor_state`; it is never derived from `updated_at`.
+- The list query is capped at 200 rows. The dashboard shows the true count and
+  a notice when the list is truncated. There is no pagination yet.
+
+### Limit settings
+
+`public.monitor_limit_settings` is a singleton table:
+
+| Column | Meaning |
+| --- | --- |
+| `singleton` | Boolean primary key, constrained to `true`. |
+| `limit_per_org` | Integer, `1`–`10,000`, default `25`. |
+| `updated_at` | Maintained by the existing `set_updated_at()` trigger. |
+
+RLS is enabled with **no** policies, and all privileges are revoked from
+`PUBLIC`, `anon`, and `authenticated`. App roles cannot read or change the
+table directly.
+
+`public.monitor_limit_per_org()` is `STABLE SECURITY DEFINER` with
+`search_path = ''`. It returns the configured value, or `25` if no row exists.
+Execute is revoked from `PUBLIC` and granted only to `authenticated`; `anon`
+cannot call it.
+
+`public.enforce_monitor_limit()` is a `SECURITY DEFINER` `BEFORE INSERT`
+trigger function with `search_path = ''`. For each inserted row it:
+
+1. Takes a transaction-scoped advisory lock keyed by
+   `onedash-monitor-limit:<organization_id>`.
+2. Counts all monitors for `new.organization_id` as the function owner
+   (bypassing RLS).
+3. Raises SQLSTATE `P0001` with `Monitor limit reached for this organization
+   (N).` when the count is at or above the limit.
+
+The lock is held until the transaction ends. Concurrent inserts for one
+organization serialize, so two requests cannot both observe the last slot. The
+lock is also taken by direct privileged inserts, not only Server Actions.
+
+The app performs a friendly pre-check using the RLS-scoped count and
+`monitor_limit_per_org()`, but that check is **not** authoritative. The trigger
+is the enforcement point. The repository maps `P0001` to a safe limit message.
+
+The limit counts active and paused monitors and applies to every insert,
+including seed data and operator SQL. Change it as a database operator:
+
+```sql
+update public.monitor_limit_settings set limit_per_org = 50;
+```
+
+This is a development guard, not a plan or billing entitlement. There is no
+Stripe integration. A value above 200 means the dashboard list is truncated
+until pagination is added.
+
 ## Worker role
 
 `onedash_worker` is a `NOLOGIN` group role. Production should create a separate
@@ -325,6 +420,9 @@ The pgTAP suite is in `supabase/tests/database/`:
   constraints, idempotency, waitlist validation, and service-role write path.
 - `004_public_status_pages.sql` — published-only public views, active/selected
   monitor filtering, and unpublish/deactivate behavior.
+- `005_monitor_management.sql` — monitor RLS and role enforcement, cross-tenant
+  denial, creator/org forgery, the protected development limit, privileged
+  bypass attempts, and the per-organization advisory lock.
 
 Run:
 
@@ -354,8 +452,16 @@ test-specific slugs and IDs so seed data does not make counts ambiguous.
 5. **No hosted deployment.** Migrations have not been pushed to a remote
    Supabase project. Do not run `supabase db push` against production without
    review and a backup.
-6. **No monitor UI or scheduler.** Phase 2 defines the data contract only.
-   Monitor CRUD is Phase 3; the checker/scheduler is Phase 4.
-7. **Service-role scope is minimal.** It can INSERT waitlist rows and has the
-   default non-DML grants, but it cannot SELECT waitlist rows. Future server
-   features need explicit, reviewed grants.
+6. **No scheduler or checker.** Phase 3 defines and manages the configuration
+   contract only. There is no test-check action, outbound request, result
+   ingestion, or alert delivery; the checker/scheduler is Phase 4.
+7. **Full SSRF protection is not implemented.** Configuration-time validation
+   rejects obvious private targets, but it does not resolve DNS, pin addresses,
+   or revalidate redirects. Do not enable customer checks before Phase 4.
+8. **The monitor limit is a development guard.** It is not a plan or billing
+   entitlement. The default is 25 per organization and is operator-editable.
+9. **The monitor list is capped at 200 rows.** There is no pagination; the
+   dashboard shows a truncation notice when the organization count is larger.
+10. **Service-role scope is minimal.** It can INSERT waitlist rows and has the
+    default non-DML grants, but it cannot SELECT waitlist rows. Future server
+    features need explicit, reviewed grants.

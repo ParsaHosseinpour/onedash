@@ -1,11 +1,11 @@
 # OneDash Roadmap
 
-**Status:** Phase 2 database foundation implemented and verified on `phase-2/database-foundation` — 2026-10-28. Schema, RLS, and migrations pass all checks; three Phase 2 criteria remain partial or deviated. The Phase 1 browser/cookie flow now passes manually against the local stack; automated Playwright E2E is still missing.
+**Status:** Phase 3 monitor configuration implemented on `phase-3/monitor-management` — 2026-10-28. Authenticated users can create, list, view, edit, pause/resume, and delete tenant-scoped HTTP/HTTPS monitor configurations. Monitoring execution is **not active**: there is no scheduler, checker, test-check action, result ingestion, or alert delivery. Phase 2 database work remains verified; Phase 4 has not started.
 **First release scope:** real HTTP/HTTPS uptime monitoring
 **Phase 0 rule (historical):** audit only. No application behavior, SQL schema, dependency, or deployment configuration was changed.
 **Phase 2 rule:** database foundation only. No monitor UI, scheduler, checker, alert sender, deployment, or remote `db push` was added.
 
-OneDash is currently a Next.js marketing site with a Supabase waitlist, a cookie-based auth foundation, and a versioned tenant-safe database schema. It is **not yet an uptime monitor**. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
+OneDash is currently a Next.js marketing site with a Supabase waitlist, a cookie-based auth foundation, a versioned tenant-safe database schema, and an authenticated monitor-configuration control plane. It is **not yet an uptime monitor**: nothing is scheduled or checked. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
 
 ## Verification snapshot (2026-10-28)
 
@@ -27,6 +27,22 @@ Phase 2 was verified on a fresh local database with Supabase CLI 2.122.0, Docker
 
 Manual browser evidence (2026-10-28): a new local user was created, confirmed through Mailpit, and landed on `/dashboard`. Refreshing kept the session. Logout cleared all auth cookies and redirected to the landing page; `/dashboard` then redirected to `/login`. Logging in again worked, and `/login` and `/signup` both redirected an authenticated user to `/dashboard`. `localStorage` stayed empty throughout; auth cookies were present while signed in and absent after logout.
 
+## Phase 3 verification snapshot (2026-10-28)
+
+| Check | Command | Actual result |
+|---|---|---|
+| Lint | `npm run lint` | Pass, no findings |
+| Type check | `npm run typecheck` | Pass |
+| Unit/integration/component tests | `npm test` | Pass: 18 files, 171 tests |
+| Production build (no Supabase env) | `npm run build` | Pass; monitor routes are dynamic |
+| Runtime dependency audit | `npm audit --omit=dev` | 0 vulnerabilities |
+| Migrations from empty | `npm run db:reset` | Pass: 6 migrations + seed |
+| Database/RLS/limit tests | `npm run db:test` | Pass: 5 files, 188 assertions |
+| Database lint | `npm run db:lint` | Pass: no schema errors |
+| Browser monitor UI | Manual browser pass | Not run in this verification pass; covered by component/action/service tests and the production build |
+
+The monitor UI has empty, loading, error, and success states; keyboard-operable forms and a focusable delete dialog; disabled pending controls; and a global notice that monitoring execution is inactive. No live customer HTTP request was made.
+
 ---
 
 ## 1. Executive summary
@@ -34,20 +50,23 @@ Manual browser evidence (2026-10-28): a new local user was created, confirmed th
 ### What exists
 
 - A polished static landing page with marketing sections, pricing copy, and waitlist CTA.
-- A Supabase-backed waitlist insert/count flow (client-side, schema-dependent, not verified against a live project).
-- Supabase email/password signup and login UI.
+- A Supabase-backed waitlist insert/count flow with server-side validation and rate limiting.
+- Supabase email/password signup and login UI with cookie-based SSR sessions.
 - A server-side email-confirmation callback (`/auth/callback`).
-- A protected `/dashboard` placeholder that verifies a server-side user.
-- A Supabase SSR session-refresh middleware.
-- A single `waitlist` table with RLS.
+- A protected `/dashboard` with tenant-scoped monitor configuration: list, detail, create, edit, pause/resume, and delete.
+- Versioned migrations, RLS, seed data, pgTAP database tests, Vitest tests, and CI.
 
 ### What does not exist
 
-- Monitor CRUD, scheduling, HTTP checks, result storage, incidents, alerting, status pages, teams, billing, or public APIs.
-- Tests, CI, migrations, observability, rate limiting, abuse controls, or security headers.
+- Scheduler, HTTP checker, check-result storage, incidents, alert delivery, status pages, teams/invitations, billing, or public APIs.
+- Automated Playwright auth or monitor E2E coverage.
 - Any production-ready checker/data-plane architecture.
 
-### Release-blocking findings
+### Release-blocking findings (Phase 0 baseline; see status above)
+
+> Items 1–3 were addressed in Phase 1. They are retained as historical audit
+> findings. Items 4–5 remain true: there is no monitoring data plane, and some
+> marketing claims are still ahead of the implementation.
 
 1. **Authentication is inconsistent and likely broken in a clean browser.** The browser client uses `@supabase/supabase-js` (`localStorage` session), while the server and middleware use `@supabase/ssr` cookie sessions. Password login does not create the cookies the server reads, and logout does not clear server cookies. See §5.1.
 2. **`next@16.2.10` has a critical security advisory.** `npm audit` recommends `next@16.4.3` or later. See §4.
@@ -529,30 +548,75 @@ Phases 1–7 are the first-release path. Phase 8 is post-launch expansion. Phase
 
 **Goal:** let an authenticated user create, inspect, pause, edit, and delete HTTP/HTTPS monitors without exposing them to other tenants.
 
-**Work**
+**Delivered (2026-10-28, `phase-3/monitor-management`)**
 
-- Build server actions or route handlers for monitor CRUD, with Zod validation and DTO responses.
-- Add a monitor list and a create/edit form: name, URL, method, expected status, headers, body, interval, timeout, regions, alert channels, and active state.
-- Validate `http`/`https` only, hostname/IP syntax, length limits, header/body size limits, and allowed methods. Reject credentials in URLs.
-- Enforce plan limits and minimum intervals server-side, not only in the UI.
-- Add a "Test check" action that calls the checker service; do not perform customer fetches inside the Next.js web tier.
-- Add pause/resume/delete confirmation, empty/loading/error states, accessible labels, and mobile layout.
-- Add authorization checks on every action and an audit-log entry for sensitive changes.
-- Start with a simple monitor detail view; charts come in Phase 6.
+- Server Actions for create, update, pause/resume, and delete, with server-side
+  auth, trusted membership/org resolution, role checks, custom validation, and
+  safe DTOs/errors. Zod was not added; validation lives in
+  `src/lib/monitor-validation.ts` and is covered by Vitest.
+- `/dashboard` list/count, `/dashboard/monitors/new`, monitor detail, and edit
+  pages, with empty/loading/error/success states, responsive layout, labels,
+  focusable delete confirmation, pending/disabled controls, and a global
+  "monitoring execution is not active" notice.
+- First-release fields: name, HTTP/HTTPS URL, `GET`/`HEAD`, expected status
+  code/list/range (max 20 codes), interval (default 5 minutes), timeout,
+  active/paused, and timestamps.
+- URL validation rejects non-HTTP schemes, malformed URLs, embedded
+  credentials, unsupported ports, and obvious localhost/private/link-local/
+  metadata targets. This is configuration-time hardening, not the Phase 4 SSRF
+  boundary.
+- A database-enforced development limit (default 25 monitors per organization)
+  using a protected singleton settings table, a `SECURITY DEFINER` read
+  function, and a `BEFORE INSERT` trigger with a per-organization advisory
+  lock. Authenticated users cannot read or raise the setting. No billing or
+  plan entitlement system was added.
+- Explicit-column repository selects keep scheduler fields, encrypted request
+  secrets, ciphertext, and worker credentials out of application DTOs.
+- Existing Phase 2 audit triggers record monitor insert/update/delete events.
+- pgTAP coverage for anon denial, same-org access, cross-org denial, viewer
+  denial, creator/org forgery, the limit, privileged bypass attempts, and the
+  advisory lock; Vitest coverage for validation, service authorization, server
+  actions, the form, list, and delete/toggle controls.
+
+**Deferred by scope**
+
+- Headers, request bodies, regions, alert-channel selection, and a "Test check"
+  action are not part of this release. There is no outbound request from the
+  Next.js process. Header/body limits and test-check results move to Phase 4/5
+  when those fields and the checker exist.
+- Full SSRF protection (DNS resolution, address pinning, redirect-hop
+  revalidation, egress isolation) is Phase 4.
+- No plan/billing enforcement; the 25-monitor limit is a documented development
+  guard.
+- The list is capped at 200 rows with no pagination.
 
 **Acceptance criteria**
 
-- [ ] A user can create an HTTP and an HTTPS monitor, see it in the list, edit it, pause/resume it, and delete it.
-- [ ] Invalid schemes, malformed URLs, oversized headers/bodies, unsupported methods, and out-of-range intervals are rejected with clear errors.
-- [ ] A URL pointing at localhost/private space is rejected at creation or test time (with a clear reason).
-- [ ] Test check returns status, latency, and a sanitized error; it does not fetch from the Next.js server process.
-- [ ] A user from another organization cannot read, update, pause, or delete the monitor (404/403 as appropriate).
-- [ ] Viewers cannot mutate monitors.
-- [ ] Plan limits are enforced by the server and tested.
-- [ ] The UI has empty, loading, error, and success states and is keyboard accessible.
-- [ ] No monitor data is rendered from placeholder/hard-coded values.
+- [x] A user can create an HTTP and an HTTPS monitor, see it in the list, edit
+  it, pause/resume it, and delete it. Covered by service/action/component tests
+  and pgTAP; a manual browser pass was not repeated in this verification pass.
+- [x] Invalid schemes, malformed URLs, unsupported methods, credentials in
+  URLs, and out-of-range intervals/statuses are rejected with clear errors.
+- [x] A URL pointing at localhost/private space is rejected at configuration
+  time with a clear reason. Full DNS/redirect SSRF enforcement remains Phase 4.
+- [ ] **DEFERRED BY DESIGN.** Test check is not implemented; Phase 3 performs
+  no outbound customer fetch.
+- [x] A user from another organization cannot read, update, pause, or delete the
+  monitor; the app returns 404/not-found and RLS denies the row.
+- [x] Viewers cannot mutate monitors (UI, service, and RLS tests).
+- [x] The development limit is enforced by the server and database and tested,
+  including direct privileged inserts and the advisory-lock path. Plan limits
+  are not implemented.
+- [x] The UI has empty, loading, error, and success states and is keyboard
+  operable; component tests cover labels, focus, Escape, pending controls, and
+  error announcements. No formal WCAG audit was run.
+- [x] No monitor status, latency, uptime, or check history is synthesized. The
+  UI shows a timestamp only when stored `monitor_state` data exists; new
+  monitors show "No checks recorded." Seed data is explicitly development data.
 
-**Exit gate:** monitor configuration is usable and tenant-safe; the worker can consume it.
+**Exit gate: met for the control plane, with the deferred items above.** Monitor
+configuration is tenant-safe and ready for the Phase 4 worker to consume; it is
+not being executed yet.
 
 ---
 

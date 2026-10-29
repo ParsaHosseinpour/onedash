@@ -2,10 +2,11 @@
 
 OneDash is an early-stage uptime-monitoring product. The current branch adds a
 versioned Supabase database foundation with tenant isolation, RLS, a hardened
-waitlist, account bootstrap, and pgTAP tests. The cookie-based auth flow has
-been verified manually in a browser; automated Playwright E2E is still missing.
-It is **not yet an uptime monitor**: there is no monitor CRUD UI, scheduler,
-checker, alert sender, or deployed public status page. See
+waitlist, account bootstrap, pgTAP tests, and a tenant-safe monitor
+configuration UI. The cookie-based auth flow has been verified manually in a
+browser; automated Playwright E2E is still missing. It is **not yet an uptime
+monitor**: there is no scheduler, HTTP checker, alert sender, or deployed public
+status page, and saved monitor configurations are not being checked. See
 [`ROADMAP.md`](./ROADMAP.md) and [`docs/database.md`](./docs/database.md).
 
 ## Stack
@@ -124,7 +125,7 @@ historical waitlist file; it is retained for reference and must not be applied
 after the migrations. The waitlist migration intentionally changes its grants
 to close the direct anon PostgREST INSERT bypass.
 
-The current suite has **150 pgTAP assertions** across four files:
+The current suite has **188 pgTAP assertions** across five files:
 
 - `001_schema_invariants.sql` — RLS coverage, indexes, constraints, function
   hardening, default privilege removal, and waitlist privileges.
@@ -136,6 +137,9 @@ The current suite has **150 pgTAP assertions** across four files:
   path.
 - `004_public_status_pages.sql` — published-only public views, active/selected
   monitor filtering, and unpublish/deactivate behavior.
+- `005_monitor_management.sql` — monitor RLS and role enforcement, cross-tenant
+  denial, the protected development limit, and the per-organization advisory
+  lock.
 
 The tests run against the seeded local database. They create their own users
 and organizations inside a transaction and roll back, and they scope assertions
@@ -210,6 +214,49 @@ changes:
 
 Unit tests mock Supabase and do not replace this browser check.
 
+## Monitor management
+
+Phase 3 adds the authenticated control plane for HTTP/HTTPS monitor
+configuration. It does **not** run checks.
+
+- Routes: `/dashboard` (list and count), `/dashboard/monitors/new`,
+  `/dashboard/monitors/[id]` (detail), and `/dashboard/monitors/[id]/edit`.
+- First-release fields: name, URL, `GET`/`HEAD`, expected status code(s),
+  interval in minutes (default 5), timeout in seconds, active/paused state, and
+  timestamps.
+- Every read and mutation resolves the organization and role from the
+  authenticated user's membership on the server. The browser never supplies an
+  organization id, user id, role, ownership flag, or plan limit.
+- Owners, admins, and members can create, edit, pause/resume, and delete.
+  Viewers are read-only. RLS and database constraints remain the final
+  boundary; the cookie-scoped anon/authenticated client is used instead of the
+  service-role key.
+- URLs must be absolute `http`/`https` URLs with a hostname, no embedded
+  credentials, and only ports 80/443. Localhost and obvious private, loopback,
+  link-local, and metadata addresses are rejected at configuration time. This
+  is not the Phase 4 SSRF boundary: the checker must still resolve and
+  revalidate every address and redirect hop before any outbound request.
+- Expected status accepts a single code (`200`), a comma list (`200, 204`), or
+  an inclusive range (`200-204`), capped at 20 codes. Intervals are 1–1,440
+  minutes; timeouts are 1–60 seconds and must be shorter than the interval.
+- Deleting requires typing the exact monitor name. The server re-reads the name
+  from the database before deleting.
+- The development limit defaults to **25 monitors per organization** and is
+  stored in `public.monitor_limit_settings`. It is enforced by a
+  `BEFORE INSERT` trigger with a per-organization advisory lock, so concurrent
+  server actions and direct PostgREST inserts cannot bypass it. This is a
+  development guard, not a billing or plan entitlement. Operators can change
+  it with SQL; see [`docs/database.md`](./docs/database.md).
+- The list is capped at 200 rows and shows a notice when the organization count
+  is larger. There is no pagination yet.
+- No check status, latency, uptime, or history is synthesized. The UI shows a
+  last-check timestamp only when `monitor_state` already contains one; new
+  monitors show “No checks recorded.” The global notice states that monitoring
+  execution is not active.
+- Monitor DTOs select an explicit safe column list. Scheduler fields, encrypted
+  request secrets, worker credentials, and ciphertext are never returned to the
+  browser.
+
 ## Waitlist security
 
 - `/api/waitlist` validates and normalizes email addresses, enforces a source
@@ -244,16 +291,21 @@ complete CSP replacement.
 src/
   app/
     actions/auth.ts          server actions for login, signup, logout
+    actions/monitors.ts      authenticated monitor CRUD/pause/delete actions
     api/waitlist/route.ts    server-side waitlist endpoint
     auth/callback/route.ts   email confirmation callback
     components/              marketing nav, waitlist form, config notice
-    dashboard/               protected placeholder
+    dashboard/               monitor list, detail, create/edit, states
     login/, signup/          auth pages and forms
   lib/
     auth.ts                  requireUser + cookie clearing
     auth-validation.ts       password and redirect allowlist rules
     email.ts                 email normalization
     env.ts                   lazy environment validation
+    monitor-config.ts        client-safe DTOs, constants, formatters
+    monitor-validation.ts    URL/status/interval/timeout validation
+    monitor-repository.ts    explicit-column data access through RLS
+    monitor-service.ts       membership, role, limit, delete rules
     rate-limit.ts            in-process limiter (documented limitation)
     server-guard.ts          runtime server-only import guard
     supabase/                server and proxy Supabase clients
@@ -267,7 +319,7 @@ supabase/
   tests/database/            pgTAP RLS, constraint, and privilege tests
   schema.sql                 legacy Phase 1 waitlist file (do not re-apply)
 docs/database.md             ERD, role matrix, RLS and retention notes
-tests/                       Vitest unit/integration tests
+tests/                       Vitest unit/integration and component tests
 ```
 
 ## CI
@@ -279,8 +331,8 @@ tests/                       Vitest unit/integration tests
 - **database** — Supabase CLI 2.122.0, `supabase start`, `supabase db reset`,
   `supabase test db --local`, and `supabase db lint --local --level warning`.
 
-The workflow does not deploy or push anything. The `phase-2/**` branch pattern
-is included in the push filter.
+The workflow does not deploy or push anything. The `phase-1/**`, `phase-2/**`,
+and `phase-3/**` branch patterns are included in the push filter.
 
 ## Verification status
 
@@ -290,19 +342,29 @@ Verified locally on 2026-10-28:
 | --- | --- |
 | `npm run lint` | Pass, no findings |
 | `npm run typecheck` | Pass |
-| `npm test` | 72 tests across 11 files pass |
+| `npm test` | 171 tests across 18 files pass |
 | `npm run build` (no Supabase env) | Pass |
 | `npm audit --omit=dev` | 0 vulnerabilities |
-| `npm run db:reset` | 5 migrations + seed pass |
-| `npm run db:test` | 150 assertions across 4 files pass |
+| `npm run db:reset` | 6 migrations + seed pass |
+| `npm run db:test` | 188 assertions across 5 files pass |
 | `npm run db:lint` | No schema errors |
 
-Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes.
+Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite.
 
-## Known gaps before Phase 3
+## Known gaps before Phase 4
 
 - Auth E2E is manual only; no Playwright suite runs in CI. Re-run the manual
   checklist above after auth changes.
+- Monitoring execution is not implemented. There is no scheduler, HTTP checker,
+  test-check action, result ingestion, alert delivery, or public status-page UI.
+  Saved configurations are not checked.
+- The full SSRF boundary is Phase 4. Configuration-time validation blocks
+  localhost and obvious private targets, but it does not resolve DNS, pin
+  addresses, or revalidate redirects.
+- The monitor limit is a development guard, not plan/billing enforcement.
+  There is no Stripe integration or entitlement model.
+- The monitor list is capped at 200 rows with no pagination. The database limit
+  is operator-configurable up to 10,000.
 - The worker role is a global scheduler role: it can read monitoring and
   alerting rows across tenants, but not profiles, organizations, audit logs, or
   status pages. This is a documented deviation from the roadmap's literal
@@ -311,5 +373,3 @@ Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated i
   partitioning are documented, not implemented.
 - The waitlist limiter is per-instance, not shared.
 - No remote Supabase project has been linked or pushed.
-- Monitor CRUD, scheduling, checking, alert delivery, and public status-page UI
-  are Phase 3+ work.
