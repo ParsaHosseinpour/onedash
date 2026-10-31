@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Untracked local duplicate checkout; not part of this project.
+    "onedash-main/**",
   ]),
 ]);
 

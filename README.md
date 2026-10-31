@@ -2,12 +2,14 @@
 
 OneDash is an early-stage uptime-monitoring product. The current branch adds a
 versioned Supabase database foundation with tenant isolation, RLS, a hardened
-waitlist, account bootstrap, pgTAP tests, and a tenant-safe monitor
-configuration UI. The cookie-based auth flow has been verified manually in a
-browser; automated Playwright E2E is still missing. It is **not yet an uptime
-monitor**: there is no scheduler, HTTP checker, alert sender, or deployed public
-status page, and saved monitor configurations are not being checked. See
-[`ROADMAP.md`](./ROADMAP.md) and [`docs/database.md`](./docs/database.md).
+waitlist, account bootstrap, pgTAP tests, a tenant-safe monitor configuration
+UI, and a standalone Phase 4A HTTP/HTTPS checker foundation. The cookie-based
+auth flow has been verified manually in a browser; automated Playwright E2E is
+still missing. It is **not yet an uptime monitor**: the checker is not wired to
+a scheduler or database, there is no alert sender or deployed public status
+page, and saved monitor configurations are not being checked. See
+[`ROADMAP.md`](./ROADMAP.md), [`docs/database.md`](./docs/database.md), and
+[`worker/README.md`](./worker/README.md).
 
 ## Stack
 
@@ -16,6 +18,7 @@ status page, and saved monitor configurations are not being checked. See
 - TypeScript
 - Tailwind CSS 4
 - Supabase Auth, Postgres, RLS, and the Supabase CLI
+- `undici` for the pinned HTTP transport and `ipaddr.js` for IP policy
 - Vitest + Testing Library
 - pgTAP database tests
 
@@ -125,7 +128,7 @@ historical waitlist file; it is retained for reference and must not be applied
 after the migrations. The waitlist migration intentionally changes its grants
 to close the direct anon PostgREST INSERT bypass.
 
-The current suite has **188 pgTAP assertions** across five files:
+The current suite has **201 pgTAP assertions** across six files:
 
 - `001_schema_invariants.sql` — RLS coverage, indexes, constraints, function
   hardening, default privilege removal, and waitlist privileges.
@@ -140,6 +143,8 @@ The current suite has **188 pgTAP assertions** across five files:
 - `005_monitor_management.sql` — monitor RLS and role enforcement, cross-tenant
   denial, the protected development limit, and the per-organization advisory
   lock.
+- `006_checker_contract.sql` — Phase 4A monitor restrictions and the extended
+  sanitized `check_results.error_class` vocabulary.
 
 The tests run against the seeded local database. They create their own users
 and organizations inside a transaction and roll back, and they scope assertions
@@ -158,7 +163,29 @@ helpers, worker role, retention/partition plan, and known deviations.
 | `npm run lint` | Run ESLint. |
 | `npm run typecheck` | Run `tsc --noEmit`. |
 | `npm test` | Run Vitest once. |
+| `npm run test:checker` | Run only the Phase 4A checker tests. |
 | `npm run test:watch` | Run Vitest in watch mode. |
+
+## Checker foundation (Phase 4A)
+
+`worker/checker/` is a standalone TypeScript checker with no Next.js request
+handler imports and no database client. It validates absolute HTTP/HTTPS URLs,
+resolves every DNS answer, rejects mixed public/private answers, pins one
+validated address, preserves the hostname for the Host header/SNI/certificate
+verification, keeps TLS verification enabled, and revalidates every redirect
+hop. Responses are read only up to a byte cap and discarded.
+
+It is tested with injected DNS/transport fakes and local loopback HTTP/HTTPS
+servers, including decimal/hex IP forms, IPv4-mapped IPv6, DNS rebinding,
+redirect-to-private, timeout, cancellation, size-cap, and redaction cases. Run
+`npm run test:checker`.
+
+This is a foundation, not a running monitoring service. There is no scheduler,
+worker service, result ingestion, or customer check. Before Phase 4B, the worker
+host must enforce egress isolation for private, link-local, loopback, metadata,
+control-plane, and Supabase private networks. Application validation alone is
+not sufficient; if the hosting environment cannot enforce it, enabling customer
+checks is a release blocker. See [`worker/README.md`](./worker/README.md).
 
 ## Environment behavior
 
@@ -320,6 +347,10 @@ supabase/
   schema.sql                 legacy Phase 1 waitlist file (do not re-apply)
 docs/database.md             ERD, role matrix, RLS and retention notes
 tests/                       Vitest unit/integration and component tests
+tests/checker/               Phase 4A checker tests and local TLS fixture
+worker/
+  checker/                   standalone HTTP/HTTPS checker (no Next.js imports)
+  README.md                  checker contract, limits, egress, Phase 4B notes
 ```
 
 ## CI
@@ -332,43 +363,48 @@ tests/                       Vitest unit/integration and component tests
   `supabase test db --local`, and `supabase db lint --local --level warning`.
 
 The workflow does not deploy or push anything. The `phase-1/**`, `phase-2/**`,
-and `phase-3/**` branch patterns are included in the push filter.
+`phase-3/**`, `phase-4/**`, and `phase-4a/**` branch patterns are included in
+the push filter.
 
 ## Verification status
 
-Verified locally on 2026-10-28:
+Verified locally on 2026-10-31:
 
 | Check | Result |
 | --- | --- |
 | `npm run lint` | Pass, no findings |
 | `npm run typecheck` | Pass |
-| `npm test` | 171 tests across 18 files pass |
+| `npm test` | 315 tests across 24 files pass |
+| `npm run test:checker` | 144 checker tests across 6 files pass |
 | `npm run build` (no Supabase env) | Pass |
 | `npm audit --omit=dev` | 0 vulnerabilities |
-| `npm run db:reset` | 6 migrations + seed pass |
-| `npm run db:test` | 188 assertions across 5 files pass |
+| `npm run db:reset` | 7 migrations + seed pass |
+| `npm run db:test` | 201 assertions across 6 files pass |
 | `npm run db:lint` | No schema errors |
 
-Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite.
+Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite. Phase 4A checker coverage is application-level only; deployment egress isolation is still unverified and remains a release blocker.
 
-## Known gaps before Phase 4
+## Known gaps before Phase 4B
 
 - Auth E2E is manual only; no Playwright suite runs in CI. Re-run the manual
   checklist above after auth changes.
-- Monitoring execution is not implemented. There is no scheduler, HTTP checker,
-  test-check action, result ingestion, alert delivery, or public status-page UI.
-  Saved configurations are not checked.
-- The full SSRF boundary is Phase 4. Configuration-time validation blocks
-  localhost and obvious private targets, but it does not resolve DNS, pin
-  addresses, or revalidate redirects.
+- Monitoring execution is not wired up. Phase 4A provides a standalone checker,
+  but there is no scheduler, worker service, test-check action, result
+  ingestion, alert delivery, or public status-page UI. Saved configurations are
+  not checked.
+- Application-level SSRF validation and DNS pinning exist in the checker, but
+  egress isolation is a deployment requirement and is not configured by this
+  repository. The worker host must deny private, link-local, loopback, metadata,
+  control-plane, and Supabase private-network egress. If it cannot, customer
+  checks are a release blocker.
+- The worker role is a global scheduler role: it can read monitoring and
+  alerting rows across tenants, but not profiles, organizations, audit logs, or
+  status pages. Phase 4B must split checker/scheduler/ingestor permissions and
+  keep secrets away from the checker.
 - The monitor limit is a development guard, not plan/billing enforcement.
   There is no Stripe integration or entitlement model.
 - The monitor list is capped at 200 rows with no pagination. The database limit
   is operator-configurable up to 10,000.
-- The worker role is a global scheduler role: it can read monitoring and
-  alerting rows across tenants, but not profiles, organizations, audit logs, or
-  status pages. This is a documented deviation from the roadmap's literal
-  "cannot read unrelated tenants" wording.
 - `check_results` is not partitioned and no rollup tables exist. Retention and
   partitioning are documented, not implemented.
 - The waitlist limiter is per-instance, not shared.

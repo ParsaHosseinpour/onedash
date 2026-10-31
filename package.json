@@ -9,6 +9,7 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:checker": "vitest run tests/checker",
     "test:watch": "vitest",
     "db:start": "supabase start",
     "db:stop": "supabase stop",
@@ -23,9 +24,11 @@
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.118.0",
+    "ipaddr.js": "^2.5.0",
     "next": "16.4.3",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "undici": "^7.30.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

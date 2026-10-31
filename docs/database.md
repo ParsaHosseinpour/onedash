@@ -1,25 +1,27 @@
 # Database foundation
 
 This document describes the Phase 2 database model, the Phase 3 monitor
-configuration and development limit, the migration workflow, RLS rules, worker
-role, and known gaps. It reflects the code on
-`phase-3/monitor-management`; it is not a claim that the schema has been
+configuration and development limit, the Phase 4A checker contract, the
+migration workflow, RLS rules, worker role, and known gaps. It reflects the
+code on `phase-4a/safe-http-checker`; it is not a claim that the schema has been
 deployed to a hosted Supabase project.
 
 ## Status
 
-- Six versioned migrations live in `supabase/migrations/`.
+- Seven versioned migrations live in `supabase/migrations/`.
 - `supabase db reset` applies all migrations and `supabase/seed.sql` from an
   empty local database.
-- `supabase test db --local` runs 188 pgTAP assertions; all pass on a fresh
+- `supabase test db --local` runs 201 pgTAP assertions; all pass on a fresh
   reset.
 - `supabase db lint --local` reports no schema errors.
 - `supabase/schema.sql` is retained as the Phase 1 historical file. The
   migrations supersede it. Do not apply `schema.sql` after the migrations.
 - Phase 3 adds the monitor management control plane and a database-enforced
-  development monitor limit. It does not add a scheduler or checker, and no
-  outbound customer request is made.
-- No remote project has been linked or pushed. Phase 4 has not started.
+  development monitor limit. Phase 4A adds a standalone checker foundation and
+  tightens the stored monitor/result contract. Neither phase adds a scheduler,
+  worker service, result ingestion, or alert delivery, and no outbound customer
+  request is made by the application.
+- No remote project has been linked or pushed. Phase 4B has not started.
 
 The Phase 1 `schema.sql` and the waitlist migration agree on the table shape,
 constraints, case-insensitive unique index, and `waitlist_count()` definition.
@@ -88,6 +90,10 @@ channels, encrypted placeholder secrets, and an alert delivery.
 6. `20261028230000_monitor_limit.sql` — protected development-limit settings,
    the `monitor_limit_per_org()` read function, and the concurrency-safe
    `BEFORE INSERT` limit trigger.
+7. `20261028233000_checker_contract.sql` — Phase 4A monitor restrictions
+   (`GET`/`HEAD`, required TLS verification, no body assertions, redirects
+   capped at five) and the extended sanitized `check_results.error_class`
+   vocabulary.
 
 ## Entity relationship diagram
 
@@ -295,8 +301,9 @@ trigger.
   HTTP/HTTPS URL, no embedded credentials, ports 80/443, `GET`/`HEAD`, expected
   status codes (single/list/range, max 20), interval 60–86,400 seconds, and
   timeout 1–60 seconds shorter than the interval. Obvious localhost/private
-  targets are rejected at configuration time; full DNS/redirect SSRF
-  enforcement is Phase 4.
+  targets are rejected at configuration time; the standalone Phase 4A checker
+  adds DNS/redirect SSRF enforcement, but it is not wired to the application
+  yet.
 - Deletion requires the exact monitor name. The server re-reads the name from
   the database before deleting.
 - Repository selects name explicit safe columns:
@@ -306,6 +313,34 @@ trigger.
   from `monitor_state`; it is never derived from `updated_at`.
 - The list query is capped at 200 rows. The dashboard shows the true count and
   a notice when the list is truncated. There is no pagination yet.
+
+### Phase 4A checker contract
+
+The Phase 4A checker lives outside the Next.js app in `worker/checker/`. It
+reuses the Phase 2/3 schema rather than creating a parallel model. The
+`20261028233000_checker_contract.sql` migration tightens the stored contract to
+match what the checker can actually execute:
+
+| Field / constraint | Phase 4A rule |
+| --- | --- |
+| `method` | `GET` or `HEAD` only. |
+| `verify_tls` | Must be `true`; TLS verification is never disabled. |
+| `expected_body_text` | Must be `null`; body assertions are not implemented. |
+| `expected_body_is_regex` | Must be `false`; regex assertions are not implemented. |
+| `follow_redirects` / `max_redirects` | When following, the budget is 1–5; otherwise it must be 0. |
+| `expected_status_codes` | Non-empty, at most 20, each 100–599 (existing rule). |
+| `timeout_seconds` | 1–60 and shorter than the interval (existing rule). |
+
+The checker independently revalidates these fields and returns
+`unsupported_configuration` for a row that violates them. This is intentional:
+a migration cannot protect a worker that reads a stale or directly-inserted
+row, and the checker must not silently ignore a configured field.
+
+The checker never writes results in Phase 4A. The `check_results.error_class`
+constraint now includes the sanitized Phase 4A classes
+`connection_failure`, `redirect_failure`, `response_too_large`, and
+`unsupported_configuration`, alongside the existing classes. No response body,
+header, URL, query string, or secret is stored in a result.
 
 ### Limit settings
 
@@ -380,6 +415,27 @@ as written. The worker can read monitoring and alerting rows across tenants; it
 cannot manage users or read unrelated tenant identity, audit, or status-page
 data. Treat the worker connection as a high-privilege data-plane credential.
 
+### Phase 4A/4B checker permissions
+
+The Phase 4A checker does not connect to the database, so it uses none of these
+grants today. The current `onedash_worker` role is broader than the checker
+needs and includes `monitor_request_secrets`, alert-channel secrets, and
+incident/state mutation. Before Phase 4B:
+
+- create a checker-specific group/login role rather than granting the checker
+  the global `onedash_worker` role;
+- grant only the monitor/schedule/lease fields needed for execution and
+  `INSERT` on `check_results` with idempotency;
+- keep scheduler/ingestor permissions separate from checker permissions where
+  possible;
+- do not grant request/alert secrets to the checker unless a later phase
+  explicitly implements authenticated request headers/bodies;
+- use a dedicated database credential, never the service-role key, and never
+  expose any service-role key to the browser or a `NEXT_PUBLIC_*` variable.
+
+This is a Phase 4B implementation requirement, not a change made by the Phase
+4A checker migration.
+
 ## Check-result retention and partitioning plan
 
 `check_results` is append-only and deliberately has no response-body or
@@ -423,6 +479,11 @@ The pgTAP suite is in `supabase/tests/database/`:
 - `005_monitor_management.sql` — monitor RLS and role enforcement, cross-tenant
   denial, creator/org forgery, the protected development limit, privileged
   bypass attempts, and the per-organization advisory lock.
+- `006_checker_contract.sql` — Phase 4A monitor restrictions (`GET`/`HEAD`,
+  required TLS verification, no body assertions, redirect cap) and the extended
+  `check_results.error_class` vocabulary.
+
+The suite currently has **201 assertions across six files**.
 
 Run:
 
@@ -452,16 +513,25 @@ test-specific slugs and IDs so seed data does not make counts ambiguous.
 5. **No hosted deployment.** Migrations have not been pushed to a remote
    Supabase project. Do not run `supabase db push` against production without
    review and a backup.
-6. **No scheduler or checker.** Phase 3 defines and manages the configuration
-   contract only. There is no test-check action, outbound request, result
-   ingestion, or alert delivery; the checker/scheduler is Phase 4.
-7. **Full SSRF protection is not implemented.** Configuration-time validation
-   rejects obvious private targets, but it does not resolve DNS, pin addresses,
-   or revalidate redirects. Do not enable customer checks before Phase 4.
-8. **The monitor limit is a development guard.** It is not a plan or billing
+6. **No scheduler, worker service, or result ingestion.** Phase 3 defines and
+   manages the configuration contract; Phase 4A adds a standalone checker
+   module. There is no test-check action, scheduler, outbound request from the
+   app, result persistence, or alert delivery. Do not describe checks as
+   running.
+7. **Egress isolation is not implemented by this repository.** The checker
+   rejects non-public addresses and pins validated DNS answers, but application
+   validation alone is not sufficient. The worker host/network must deny
+   egress to private, link-local, loopback, metadata, control-plane, and
+   Supabase private networks. If the hosting environment cannot enforce that,
+   customer checks are a release blocker. See `worker/README.md`.
+8. **The worker role is broader than the checker needs.** `onedash_worker` is a
+   global scheduler role with cross-tenant monitoring/alerting access and
+   secret reads. Phase 4B must split checker/scheduler/ingestor permissions.
+   The Phase 4A checker does not use the database.
+9. **The monitor limit is a development guard.** It is not a plan or billing
    entitlement. The default is 25 per organization and is operator-editable.
-9. **The monitor list is capped at 200 rows.** There is no pagination; the
-   dashboard shows a truncation notice when the organization count is larger.
-10. **Service-role scope is minimal.** It can INSERT waitlist rows and has the
+10. **The monitor list is capped at 200 rows.** There is no pagination; the
+    dashboard shows a truncation notice when the organization count is larger.
+11. **Service-role scope is minimal.** It can INSERT waitlist rows and has the
     default non-DML grants, but it cannot SELECT waitlist rows. Future server
     features need explicit, reviewed grants.

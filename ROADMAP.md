@@ -1,11 +1,11 @@
 # OneDash Roadmap
 
-**Status:** Phase 3 monitor configuration implemented on `phase-3/monitor-management` — 2026-10-28. Authenticated users can create, list, view, edit, pause/resume, and delete tenant-scoped HTTP/HTTPS monitor configurations. Monitoring execution is **not active**: there is no scheduler, checker, test-check action, result ingestion, or alert delivery. Phase 2 database work remains verified; Phase 4 has not started.
+**Status:** Phase 4A safe HTTP/HTTPS checker foundation implemented on `phase-4a/safe-http-checker` — 2026-10-31. Phase 3 monitor configuration remains verified. The checker is standalone and independently tested, but it is **not wired to a scheduler or database**: there is no worker service, test-check action, result ingestion, alert delivery, or customer check. Phase 4B (scheduling, worker service, ingestion, regions, metrics) has not started. Hosting egress isolation is an explicit release blocker for customer checks.
 **First release scope:** real HTTP/HTTPS uptime monitoring
 **Phase 0 rule (historical):** audit only. No application behavior, SQL schema, dependency, or deployment configuration was changed.
 **Phase 2 rule:** database foundation only. No monitor UI, scheduler, checker, alert sender, deployment, or remote `db push` was added.
 
-OneDash is currently a Next.js marketing site with a Supabase waitlist, a cookie-based auth foundation, a versioned tenant-safe database schema, and an authenticated monitor-configuration control plane. It is **not yet an uptime monitor**: nothing is scheduled or checked. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
+OneDash is currently a Next.js marketing site with a Supabase waitlist, a cookie-based auth foundation, a versioned tenant-safe database schema, an authenticated monitor-configuration control plane, and a standalone Phase 4A checker foundation. It is **not yet an uptime monitor**: no customer check is scheduled or executed, and there is no scheduler, worker service, result ingestion, or alert delivery. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
 
 ## Verification snapshot (2026-10-28)
 
@@ -43,6 +43,24 @@ Manual browser evidence (2026-10-28): a new local user was created, confirmed th
 
 The monitor UI has empty, loading, error, and success states; keyboard-operable forms and a focusable delete dialog; disabled pending controls; and a global notice that monitoring execution is inactive. No live customer HTTP request was made.
 
+## Phase 4A verification snapshot (2026-10-31)
+
+Phase 4A was verified locally with Supabase CLI 2.122.0, Docker Desktop, and Node 24.
+
+| Check | Command | Actual result |
+|---|---|---|
+| Lint | `npm run lint` | Pass, no findings |
+| Type check | `npm run typecheck` | Pass |
+| Unit/integration/component tests | `npm test` | Pass: 24 files, 315 tests |
+| Checker-only tests | `npm run test:checker` | Pass: 6 files, 144 tests |
+| Production build (no Supabase env) | `npm run build` | Pass |
+| Runtime dependency audit | `npm audit --omit=dev` | 0 vulnerabilities |
+| Migrations from empty | `npm run db:reset` | Pass: 7 migrations + seed |
+| Database/RLS/checker-contract tests | `npm run db:test` | Pass: 6 files, 201 assertions |
+| Database lint | `npm run db:lint` | Pass: no schema errors |
+
+The checker tests use injected DNS/transport fakes and local loopback HTTP/HTTPS servers. No arbitrary external website is required. Deployment-level egress isolation was **not** verified and remains a release blocker for customer checks.
+
 ---
 
 ## 1. Executive summary
@@ -54,24 +72,27 @@ The monitor UI has empty, loading, error, and success states; keyboard-operable 
 - Supabase email/password signup and login UI with cookie-based SSR sessions.
 - A server-side email-confirmation callback (`/auth/callback`).
 - A protected `/dashboard` with tenant-scoped monitor configuration: list, detail, create, edit, pause/resume, and delete.
+- A standalone Phase 4A HTTP/HTTPS checker foundation with SSRF/DNS-rebinding defenses and independent tests; it is not wired to the app.
 - Versioned migrations, RLS, seed data, pgTAP database tests, Vitest tests, and CI.
 
 ### What does not exist
 
-- Scheduler, HTTP checker, check-result storage, incidents, alert delivery, status pages, teams/invitations, billing, or public APIs.
+- Scheduler, worker service, check-result ingestion, customer checks, alert delivery, operational incident/status-page management, teams/invitations, billing, or public APIs. The Phase 4A checker module exists but is not connected to any of these.
 - Automated Playwright auth or monitor E2E coverage.
-- Any production-ready checker/data-plane architecture.
+- A deployed, production-ready data plane with enforced worker egress isolation.
 
 ### Release-blocking findings (Phase 0 baseline; see status above)
 
 > Items 1–3 were addressed in Phase 1. They are retained as historical audit
-> findings. Items 4–5 remain true: there is no monitoring data plane, and some
-> marketing claims are still ahead of the implementation.
+> findings. Item 4 is only partially addressed: Phase 4A adds a tested checker
+> foundation, but the scheduler, worker service, ingestion, and enforced egress
+> isolation are still absent. Item 5 remains true for the unimplemented
+> monitoring, alerting, and status-page claims.
 
 1. **Authentication is inconsistent and likely broken in a clean browser.** The browser client uses `@supabase/supabase-js` (`localStorage` session), while the server and middleware use `@supabase/ssr` cookie sessions. Password login does not create the cookies the server reads, and logout does not clear server cookies. See §5.1.
 2. **`next@16.2.10` has a critical security advisory.** `npm audit` recommends `next@16.4.3` or later. See §4.
 3. **A clean production build fails without Supabase environment variables.** The landing page imports a browser module that throws during prerender. See §4.
-4. **The monitoring data plane is entirely absent.** A Next.js/Vercel deployment must not be used as the scheduler or checker. See §6.
+4. **The monitoring data plane is not operational.** Phase 4A provides only a standalone checker module; the scheduler, worker service, result ingestion, and enforced worker egress isolation are absent. A Next.js/Vercel deployment must not be used as the scheduler or checker. See §6.
 5. **Marketing claims are ahead of the implementation.** Ping/TCP/cron monitoring, multi-region checks, alerts, status pages, teams, and pricing tiers do not exist yet. See §3.
 
 ---
@@ -624,13 +645,52 @@ not being executed yet.
 
 **Goal:** execute checks reliably from isolated workers and persist trustworthy results.
 
-**Work**
+**Phase 4A status (2026-10-31): delivered on `phase-4a/safe-http-checker`.** The
+standalone module in `worker/checker/` is independently tested and not imported
+by Next.js. It is not connected to a scheduler, database, or customer monitor.
+
+Phase 4A delivered:
+
+- A bounded checker contract for `GET`/`HEAD`, expected statuses, timeout,
+  required TLS verification, and optional redirect following.
+- URL, scheme, credential, port, hostname, and redirect validation.
+- DNS resolution with every-answer validation, mixed public/private rejection,
+  and one-address pinning.
+- A pinned Undici connector that preserves the Host header, TLS SNI, and
+  certificate-verification name; TLS verification stays enabled and no second
+  unchecked DNS lookup is performed.
+- Manual redirect revalidation, loop detection, and a five-hop cap.
+- Total deadline, DNS/connect/header/body timeouts, response-size cap, redirect
+  cap, concurrency cap, and cleanup on success, failure, timeout, or
+  cancellation.
+- Sanitized results with fixed messages and no URL, hostname, query, headers,
+  body, cookies, or secrets.
+- Injected DNS/transport tests, local loopback HTTP/HTTPS tests, and pgTAP
+  coverage for the tightened monitor/result contract.
+- `ROADMAP.md`, `README.md`, `docs/database.md`, and `worker/README.md`
+  documentation, including the egress-isolation release blocker.
+
+Deferred to Phase 4B/4C:
+
+- Dockerized worker service, bounded DB connections, graceful shutdown, and
+  heartbeat.
+- Scheduler queueing, per-region jobs, idempotency keys, leases, jitter,
+  retries, dead-letter handling, and result persistence.
+- Request headers/bodies/secrets, body assertions, certificate-expiry capture,
+  and latency-threshold evaluation.
+- Two or more regions, confirmation/quorum policy, worker metrics, load tests,
+  and runbook.
+- Deployment-level egress isolation. Application validation is not sufficient;
+  the worker host/network must deny private, link-local, loopback, metadata,
+  control-plane, and Supabase private-network egress. If the hosting environment
+  cannot enforce this, customer checks remain blocked.
+
+**Work remaining for the full phase**
 
 - Create a standalone worker service (TypeScript/Node, Dockerized) with bounded DB connections and graceful shutdown.
 - Implement scheduler queueing with per-region jobs, unique idempotency keys, leases, jitter, retries, dead-letter handling, and heartbeat.
-- Implement the HTTP checker with `undici`/Node fetch and explicit control over DNS, connect, TLS, redirects, timeouts, and body limits.
-- Implement request configuration: methods, headers (encrypted), body, expected statuses, keyword/regex assertion, TLS verification, certificate-expiry capture, and latency breakdown.
-- Implement SSRF defenses: private/reserved IP rejection, DNS pinning, redirect revalidation, port allowlist, metadata blocking, and egress isolation.
+- Extend the Phase 4A checker with the deferred request configuration and result persistence.
+- Enforce egress isolation in the worker deployment.
 - Persist results with region, attempt, timings, status, and sanitized error class. Make writes idempotent.
 - Add at least two regions and a configurable confirmation/quorum policy.
 - Add worker metrics: checks attempted/succeeded/failed, duration, scheduler lag, queue depth, heartbeat, and dead-letter count.
@@ -641,17 +701,19 @@ not being executed yet.
 - [ ] A monitor configured at a 5-minute interval is checked close to schedule; scheduler lag p95 is measured and within the agreed target (proposed: ≤15 seconds).
 - [ ] Duplicate jobs for the same monitor/region/scheduled time produce one idempotent result.
 - [ ] Killing a worker mid-check loses no acknowledged job; leases expire and work is retried.
-- [ ] Timeout, connection refused, DNS failure, TLS failure, status mismatch, body mismatch, and redirect loop produce distinct, sanitized results.
-- [ ] Redirects are validated at every hop and cannot reach a private/metadata address.
-- [ ] The SSRF test suite blocks localhost, RFC1918, link-local, IPv6 equivalents, metadata IPs, decimal/hex IP forms, DNS rebinding, and redirect-to-private cases.
-- [ ] Only ports 80/443 are allowed by default; any exception is explicit and tested.
-- [ ] Response bodies are not stored; secrets are redacted from logs and results.
+- [x] **Phase 4A:** timeout, connection refused, DNS failure, TLS failure, status mismatch, redirect loop, blocked target, response too large, unsupported configuration, and internal error produce distinct, sanitized results.
+- [ ] Body-mismatch results are implemented. Phase 4A rejects body assertions as `unsupported_configuration` instead of silently ignoring them.
+- [x] **Phase 4A:** redirects are validated at every hop and cannot reach a private/metadata address.
+- [x] **Phase 4A:** the application-level SSRF suite blocks localhost, RFC1918, link-local, IPv6 equivalents, metadata IPs, decimal/hex IP forms, IPv4-compatible/mapped forms, DNS rebinding, and redirect-to-private cases.
+- [ ] **Deployment gate:** the worker host/network enforces egress isolation for private, link-local, loopback, metadata, control-plane, and Supabase private networks. This is a release blocker, not an application-only claim.
+- [x] **Phase 4A:** only ports 80/443 are allowed by default; the checker has no exception path.
+- [x] **Phase 4A:** response bodies are not stored; checker results contain no URL, hostname, query, headers, body, cookies, or secrets.
 - [ ] At least two regions return tagged results; the confirmation policy is documented and testable.
 - [ ] A load test for the agreed initial capacity (for example, 1,000 monitors at a 5-minute interval) meets the lag/duration targets.
 - [ ] Worker heartbeat, scheduler lag, queue depth, and failure metrics are visible.
-- [ ] The checker does not run inside Vercel request handlers or rely on serverless cron as its only scheduler.
+- [x] **Phase 4A:** the checker does not run inside Vercel request handlers or rely on serverless cron as its only scheduler.
 
-**Exit gate:** checks are reliable, isolated, and safe enough to enable for internal test monitors.
+**Exit gate:** checks are reliable, isolated, and safe enough to enable for internal test monitors. Phase 4A clears the checker-foundation portion only; the scheduler, persistence, regions, metrics, and deployment egress gate remain unmet, so the full exit gate is not cleared.
 
 ---
 
