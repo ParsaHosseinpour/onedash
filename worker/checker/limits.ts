@@ -13,6 +13,8 @@ export type CheckerLimits = {
   dnsTimeoutMs: number;
   maxResponseBytes: number;
   maxRedirects: number;
+  /** Maximum validated addresses tried for one hostname before giving up. */
+  maxAddressAttempts: number;
   maxConcurrency: number;
   maxUrlLength: number;
   maxStatusCodes: number;
@@ -26,6 +28,7 @@ export const CHECKER_LIMITS: Readonly<CheckerLimits> = Object.freeze({
   dnsTimeoutMs: 5_000,
   maxResponseBytes: 1_048_576,
   maxRedirects: 5,
+  maxAddressAttempts: 3,
   maxConcurrency: 10,
   maxUrlLength: 2_048,
   maxStatusCodes: 20,
@@ -90,6 +93,11 @@ export function resolveCheckerLimits(
       merged.maxRedirects,
       "maxRedirects",
       CHECKER_LIMITS.maxRedirects,
+    ),
+    maxAddressAttempts: positiveInteger(
+      merged.maxAddressAttempts,
+      "maxAddressAttempts",
+      CHECKER_LIMITS.maxAddressAttempts,
     ),
     maxConcurrency: positiveInteger(
       merged.maxConcurrency,

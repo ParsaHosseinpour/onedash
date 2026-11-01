@@ -20,6 +20,7 @@ import {
   createUndiciTransport,
   type CheckerMethod,
   type HttpTransport,
+  type HttpTransportResponse,
 } from "./transport";
 import {
   parseRedirectTarget,
@@ -59,11 +60,20 @@ export type CheckResult = {
   checkedAt: string;
 };
 
+export type CheckMonitorTestOptions = {
+  /** Test seam only. Production must use the immutable public-address policy. */
+  addressPolicy?: (address: string) => boolean;
+  /** Test seam only. Production allows ports 80 and 443. */
+  allowedPorts?: readonly number[];
+};
+
 export type CheckMonitorOptions = {
   dnsResolver?: DnsResolver;
   transport?: HttpTransport;
   /** Test seam only; ceilings are still enforced by resolveCheckerLimits. */
   limits?: Partial<CheckerLimits>;
+  /** Test seam only. Rejected outside NODE_ENV=test. */
+  testOnly?: CheckMonitorTestOptions;
   signal?: AbortSignal;
   now?: () => number;
 };
@@ -83,9 +93,35 @@ function roundMs(value: number): number {
   return Math.max(0, Math.round(value));
 }
 
+function resolveTestOnlyOptions(
+  testOnly: CheckMonitorTestOptions | undefined,
+): CheckMonitorTestOptions {
+  if (!testOnly) return {};
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("test-only checker options are not allowed");
+  }
+  return testOnly;
+}
+
+/**
+ * Address fallback is limited to failures that occurred before an HTTP
+ * response existed. A returned status code, including a 4xx/5xx response, is
+ * never retried on another address. TLS errors are also not retried: a
+ * certificate failure is a security result, not a routing failure.
+ */
+function isRetryableAddressFailure(error: unknown): boolean {
+  if (!(error instanceof TransportError)) return false;
+  return (
+    error.kind === "connection_refused" ||
+    error.kind === "connection_failure" ||
+    error.kind === "timeout"
+  );
+}
+
 function normalizeConfig(
   config: MonitorCheckConfig,
   limits: CheckerLimits,
+  allowedPorts?: readonly number[],
 ): NormalizedConfig {
   if (
     config.hasRequestSecrets !== undefined &&
@@ -179,7 +215,7 @@ function normalizeConfig(
     throw new UnsupportedConfigurationError();
   }
 
-  const target = validateTargetUrl(config.url, limits);
+  const target = validateTargetUrl(config.url, limits, allowedPorts);
 
   return {
     target,
@@ -260,6 +296,7 @@ export async function checkMonitor(
   }
 
   const limits = resolveCheckerLimits(options.limits);
+  const testOnly = resolveTestOnlyOptions(options.testOnly);
   const started = performance.now();
   const checkedAt = new Date((options.now ?? Date.now)()).toISOString();
 
@@ -303,7 +340,7 @@ export async function checkMonitor(
 
   let normalized: NormalizedConfig;
   try {
-    normalized = normalizeConfig(config, limits);
+    normalized = normalizeConfig(config, limits, testOnly.allowedPorts);
   } catch (error) {
     const classified = errorClassFor(error);
     return result("error", classified.errorClass, classified.message);
@@ -340,6 +377,7 @@ export async function checkMonitor(
           resolver,
           signal: controller.signal,
           dnsTimeoutMs: Math.min(remainingMs, limits.dnsTimeoutMs),
+          addressPolicy: testOnly.addressPolicy,
         }),
         controller.signal,
       );
@@ -347,31 +385,54 @@ export async function checkMonitor(
       dnsMeasured = true;
       timings.dnsMs += destination.dnsMs;
 
-      const remainingForRequest =
-        normalized.timeoutMs - (performance.now() - started);
-      if (remainingForRequest <= 0) {
-        throw new CheckTimeoutError();
+      const attemptAddresses = destination.addresses.slice(
+        0,
+        limits.maxAddressAttempts,
+      );
+      let response: HttpTransportResponse | null = null;
+
+      for (let attempt = 0; attempt < attemptAddresses.length; attempt += 1) {
+        const remainingForRequest =
+          normalized.timeoutMs - (performance.now() - started);
+        if (remainingForRequest <= 0) {
+          throw new CheckTimeoutError();
+        }
+
+        try {
+          response = await withAbort(
+            transport.request({
+              url: current.url,
+              method: normalized.method,
+              pinnedAddress: attemptAddresses[attempt],
+              tlsServername: current.isIpLiteral ? null : current.hostname,
+              timeoutMs: Math.max(1, Math.floor(remainingForRequest)),
+              connectTimeoutMs: Math.max(
+                1,
+                Math.min(
+                  Math.floor(remainingForRequest),
+                  limits.connectTimeoutMs,
+                ),
+              ),
+              maxResponseBytes: limits.maxResponseBytes,
+              signal: controller.signal,
+            }),
+            controller.signal,
+          );
+          break;
+        } catch (error) {
+          if (error instanceof CheckCancelledError) throw error;
+          if (controller.signal.aborted) throw error;
+
+          const canTryAnotherAddress =
+            attempt < attemptAddresses.length - 1 &&
+            isRetryableAddressFailure(error);
+          if (!canTryAnotherAddress) throw error;
+        }
       }
 
-      const response = await withAbort(
-        transport.request({
-          url: current.url,
-          method: normalized.method,
-          pinnedAddress: destination.pinned,
-          tlsServername: current.isIpLiteral ? null : current.hostname,
-          timeoutMs: Math.max(1, Math.floor(remainingForRequest)),
-          connectTimeoutMs: Math.max(
-            1,
-            Math.min(
-              Math.floor(remainingForRequest),
-              limits.connectTimeoutMs,
-            ),
-          ),
-          maxResponseBytes: limits.maxResponseBytes,
-          signal: controller.signal,
-        }),
-        controller.signal,
-      );
+      if (!response) {
+        throw new TransportError("connection_failure");
+      }
 
       if (response.timings.connectMs !== null) {
         connectMeasured = true;
@@ -402,6 +463,7 @@ export async function checkMonitor(
           response.location,
           current.url,
           limits,
+          testOnly.allowedPorts,
         );
 
         if (visited.has(next.canonical)) {

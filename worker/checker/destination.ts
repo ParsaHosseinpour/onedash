@@ -27,10 +27,31 @@ export interface DnsResolver {
 export type Destination = {
   /** Every address returned by DNS, normalized, deduplicated, and validated. */
   addresses: ResolvedAddress[];
-  /** The single address the connection is pinned to. */
+  /** The first validated address; retained for callers that only want one. */
   pinned: ResolvedAddress;
   dnsMs: number;
 };
+
+export type ResolveDestinationOptions = {
+  resolver: DnsResolver;
+  signal: AbortSignal;
+  dnsTimeoutMs: number;
+  /**
+   * Test seam only. Production callers must omit this so the immutable public
+   * address policy is always used. It is rejected outside NODE_ENV=test.
+   */
+  addressPolicy?: (address: string) => boolean;
+};
+
+function selectAddressPolicy(
+  options: ResolveDestinationOptions,
+): (address: string) => boolean {
+  if (!options.addressPolicy) return publicAddressPolicy;
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("custom destination address policies are test-only");
+  }
+  return options.addressPolicy;
+}
 
 class DnsTimeoutError extends Error {
   constructor() {
@@ -105,21 +126,20 @@ export function createSystemDnsResolver(): DnsResolver {
 }
 
 /**
- * Validates every DNS answer and pins the first one. Mixed public/private
- * answers are rejected as a whole; the checker never selects the "public"
- * subset and hopes for the best.
+ * Validates every DNS answer and returns the complete validated list. The
+ * checker pins and tries up to its own strict address-attempt cap. Mixed
+ * public/private answers are rejected as a whole; the checker never selects
+ * the "public" subset and hopes for the best.
  */
 export async function resolveDestination(
   target: ValidatedTarget,
-  options: {
-    resolver: DnsResolver;
-    signal: AbortSignal;
-    dnsTimeoutMs: number;
-  },
+  options: ResolveDestinationOptions,
 ): Promise<Destination> {
+  const addressPolicy = selectAddressPolicy(options);
+
   if (target.isIpLiteral) {
     const literal = target.ipLiteral;
-    if (!literal || !publicAddressPolicy(literal.address)) {
+    if (!literal || !addressPolicy(literal.address)) {
       throw new UnsafeTargetError();
     }
     return { addresses: [literal], pinned: literal, dnsMs: 0 };
@@ -166,7 +186,7 @@ export async function resolveDestination(
       // private. Keep the two result classes distinct.
       throw new DnsResolutionError(false);
     }
-    if (!publicAddressPolicy(parsed.address)) {
+    if (!addressPolicy(parsed.address)) {
       throw new UnsafeTargetError();
     }
     if (!seen.has(parsed.address)) {

@@ -388,7 +388,7 @@ describe("checkMonitor", () => {
   it("blocks a redirect to a private address", async () => {
     const dns = publicDns();
     const transport = new FakeTransport(() =>
-      transportResponse({ statusCode: 302, location: "http://127.0.0.1/" }),
+      transportResponse({ statusCode: 302, location: "https://127.0.0.1/" }),
     );
 
     const result = await checkMonitor(
@@ -417,6 +417,234 @@ describe("checkMonitor", () => {
     expect(result.errorClass).toBe("blocked_target");
     expect(dns.calls).toHaveLength(2);
     expect(transport.calls).toHaveLength(1);
+  });
+
+  it("rejects an HTTPS-to-HTTP redirect downgrade by default", async () => {
+    const transport = new FakeTransport(() =>
+      transportResponse({
+        statusCode: 302,
+        location: "http://other.example/plain",
+      }),
+    );
+
+    const result = await checkMonitor(
+      baseConfig({ followRedirects: true, maxRedirects: 2 }),
+      { dnsResolver: publicDns(), transport },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.errorClass).toBe("redirect_failure");
+    expect(result.redirects).toBe(0);
+    expect(transport.calls).toHaveLength(1);
+  });
+
+  it("follows an HTTP-to-HTTPS upgrade and an HTTPS-to-HTTPS redirect", async () => {
+    const dns = new FakeDnsResolver(() => [resolved(PUBLIC_IPV4)]);
+    const transport = new FakeTransport((_input, index) => {
+      if (index === 0) {
+        return transportResponse({
+          statusCode: 301,
+          location: "https://example.com/secure",
+        });
+      }
+      if (index === 1) {
+        return transportResponse({
+          statusCode: 302,
+          location: "https://other.example/final",
+        });
+      }
+      return transportResponse({ statusCode: 200 });
+    });
+
+    const result = await checkMonitor(
+      baseConfig({
+        url: "http://example.com/start",
+        followRedirects: true,
+        maxRedirects: 3,
+      }),
+      { dnsResolver: dns, transport },
+    );
+
+    expect(result.status).toBe("up");
+    expect(result.redirects).toBe(2);
+    expect(transport.calls.map((call) => call.url.toString())).toEqual([
+      "http://example.com/start",
+      "https://example.com/secure",
+      "https://other.example/final",
+    ]);
+    expect(transport.calls.map((call) => call.tlsServername)).toEqual([
+      "example.com",
+      "example.com",
+      "other.example",
+    ]);
+  });
+
+  it("rejects a downgrade that appears later in an HTTPS redirect chain", async () => {
+    const transport = new FakeTransport((_input, index) => {
+      if (index === 0) {
+        return transportResponse({
+          statusCode: 302,
+          location: "https://example.com/next",
+        });
+      }
+      return transportResponse({
+        statusCode: 302,
+        location: "http://example.com/plain",
+      });
+    });
+
+    const result = await checkMonitor(
+      baseConfig({ followRedirects: true, maxRedirects: 3 }),
+      { dnsResolver: publicDns(), transport },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.errorClass).toBe("redirect_failure");
+    expect(result.redirects).toBe(1);
+    expect(transport.calls.map((call) => call.url.toString())).toEqual([
+      "https://example.com/health",
+      "https://example.com/next",
+    ]);
+  });
+
+  it("falls back to the next validated public address after a connection failure", async () => {
+    const dns = new FakeDnsResolver(() => [
+      resolved(PUBLIC_IPV4),
+      resolved("8.8.8.8"),
+    ]);
+    const transport = new FakeTransport((_input, index) => {
+      if (index === 0) {
+        throw new TransportError("connection_refused");
+      }
+      return transportResponse({ statusCode: 200, bytesRead: 7 });
+    });
+
+    const result = await checkMonitor(baseConfig(), {
+      dnsResolver: dns,
+      transport,
+      limits: { maxAddressAttempts: 2 },
+    });
+
+    expect(result.status).toBe("up");
+    expect(result.httpStatus).toBe(200);
+    expect(result.responseBytes).toBe(7);
+    expect(dns.calls).toHaveLength(1);
+    expect(transport.calls).toHaveLength(2);
+    expect(transport.calls.map((call) => call.pinnedAddress)).toEqual([
+      { address: PUBLIC_IPV4, family: 4 },
+      { address: "8.8.8.8", family: 4 },
+    ]);
+    expect(transport.calls.map((call) => call.tlsServername)).toEqual([
+      "example.com",
+      "example.com",
+    ]);
+  });
+
+  it("tries a connection-level timeout on another validated address", async () => {
+    const dns = new FakeDnsResolver(() => [
+      resolved(PUBLIC_IPV4),
+      resolved("8.8.8.8"),
+    ]);
+    const transport = new FakeTransport((_input, index) => {
+      if (index === 0) {
+        throw new TransportError("timeout");
+      }
+      return transportResponse({ statusCode: 200 });
+    });
+
+    const result = await checkMonitor(baseConfig(), {
+      dnsResolver: dns,
+      transport,
+      limits: { maxAddressAttempts: 2 },
+    });
+
+    expect(result.status).toBe("up");
+    expect(transport.calls).toHaveLength(2);
+    expect(transport.calls[0].tlsServername).toBe("example.com");
+    expect(transport.calls[1].tlsServername).toBe("example.com");
+  });
+
+  it("stops after the strict address-attempt cap when every address fails", async () => {
+    const dns = new FakeDnsResolver(() => [
+      resolved(PUBLIC_IPV4),
+      resolved("8.8.8.8"),
+      resolved("1.1.1.1"),
+    ]);
+    const transport = new FakeTransport(() => {
+      throw new TransportError("connection_failure");
+    });
+
+    const result = await checkMonitor(baseConfig(), {
+      dnsResolver: dns,
+      transport,
+      limits: { maxAddressAttempts: 2 },
+    });
+
+    expect(result.status).toBe("error");
+    expect(result.errorClass).toBe("connection_failure");
+    expect(result.httpStatus).toBeNull();
+    expect(dns.calls).toHaveLength(1);
+    expect(transport.calls).toHaveLength(2);
+    expect(transport.calls.map((call) => call.pinnedAddress.address)).toEqual([
+      PUBLIC_IPV4,
+      "8.8.8.8",
+    ]);
+  });
+
+  it("does not retry a genuine HTTP error response on another address", async () => {
+    const dns = new FakeDnsResolver(() => [
+      resolved(PUBLIC_IPV4),
+      resolved("8.8.8.8"),
+    ]);
+    const transport = new FakeTransport((_input, index) => {
+      if (index === 0) {
+        return transportResponse({ statusCode: 503 });
+      }
+      return transportResponse({ statusCode: 200 });
+    });
+
+    const result = await checkMonitor(baseConfig(), {
+      dnsResolver: dns,
+      transport,
+      limits: { maxAddressAttempts: 2 },
+    });
+
+    expect(result.status).toBe("down");
+    expect(result.httpStatus).toBe(503);
+    expect(result.errorClass).toBe("http_status_mismatch");
+    expect(transport.calls).toHaveLength(1);
+  });
+
+  it("does not extend the total deadline while trying another address", async () => {
+    const dns = new FakeDnsResolver(() => [
+      resolved(PUBLIC_IPV4),
+      resolved("8.8.8.8"),
+    ]);
+    const transport = new FakeTransport((_input, index) => {
+      if (index === 0) {
+        return new Promise(() => {
+          // Intentionally never settles; the total deadline must abort it.
+        });
+      }
+      return transportResponse({ statusCode: 200 });
+    });
+
+    const result = await checkMonitor(baseConfig({ timeoutSeconds: 1 }), {
+      dnsResolver: dns,
+      transport,
+      limits: {
+        minTimeoutMs: 100,
+        maxTimeoutMs: 2_000,
+        dnsTimeoutMs: 500,
+        connectTimeoutMs: 500,
+        maxAddressAttempts: 2,
+      },
+    });
+
+    expect(result.status).toBe("error");
+    expect(result.errorClass).toBe("timeout");
+    expect(transport.calls).toHaveLength(1);
+    expect(transport.calls[0].signal.aborted).toBe(true);
   });
 
   it.each([

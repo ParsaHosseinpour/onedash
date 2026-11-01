@@ -46,6 +46,7 @@ export type {
   Destination,
   DnsLookupOptions,
   DnsResolver,
+  ResolveDestinationOptions,
   ResolvedAddress,
 } from "./destination";
 
@@ -60,6 +61,7 @@ export type {
 export { checkMonitor } from "./checker";
 export type {
   CheckMonitorOptions,
+  CheckMonitorTestOptions,
   CheckResult,
   MonitorCheckConfig,
 } from "./checker";
