@@ -1,11 +1,11 @@
 # OneDash Roadmap
 
-**Status:** Phase 4A safe HTTP/HTTPS checker foundation implemented on `phase-4a/safe-http-checker` — 2026-10-31. Phase 3 monitor configuration remains verified. The checker is standalone and independently tested, but it is **not wired to a scheduler or database**: there is no worker service, test-check action, result ingestion, alert delivery, or customer check. Phase 4B (scheduling, worker service, ingestion, regions, metrics) has not started. Hosting egress isolation is an explicit release blocker for customer checks.
+**Status:** Phase 4A.1 reliability and TLS hardening implemented on `phase-4a/safe-http-checker` — 2026-11-01. Phase 3 monitor configuration remains verified. Phase 4A.1 adds HTTPS-downgrade rejection, bounded validated-address fallback, local trusted-TLS tests, persisted redirect/response-size metrics, a read-only migration preflight, and removal of the committed test private key. The checker is standalone and independently tested, but it is **not wired to a scheduler or database**: there is no worker service, test-check action, result ingestion, alert delivery, or customer check. Phase 4B (scheduling, worker service, ingestion, regions, metrics) has not started. Hosting egress isolation is an explicit release blocker for customer checks.
 **First release scope:** real HTTP/HTTPS uptime monitoring
 **Phase 0 rule (historical):** audit only. No application behavior, SQL schema, dependency, or deployment configuration was changed.
 **Phase 2 rule:** database foundation only. No monitor UI, scheduler, checker, alert sender, deployment, or remote `db push` was added.
 
-OneDash is currently a Next.js marketing site with a Supabase waitlist, a cookie-based auth foundation, a versioned tenant-safe database schema, an authenticated monitor-configuration control plane, and a standalone Phase 4A checker foundation. It is **not yet an uptime monitor**: no customer check is scheduled or executed, and there is no scheduler, worker service, result ingestion, or alert delivery. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
+OneDash is currently a Next.js marketing site with a Supabase waitlist, a cookie-based auth foundation, a versioned tenant-safe database schema, an authenticated monitor-configuration control plane, and a standalone Phase 4A.1 checker foundation. It is **not yet an uptime monitor**: no customer check is scheduled or executed, and there is no scheduler, worker service, result ingestion, or alert delivery. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
 
 ## Verification snapshot (2026-10-28)
 
@@ -60,6 +60,25 @@ Phase 4A was verified locally with Supabase CLI 2.122.0, Docker Desktop, and Nod
 | Database lint | `npm run db:lint` | Pass: no schema errors |
 
 The checker tests use injected DNS/transport fakes and local loopback HTTP/HTTPS servers. No arbitrary external website is required. Deployment-level egress isolation was **not** verified and remains a release blocker for customer checks.
+
+## Phase 4A.1 verification snapshot (2026-11-01)
+
+Phase 4A.1 was verified locally with Supabase CLI 2.122.0, Docker Desktop, and Node 24.
+
+| Check | Command | Actual result |
+|---|---|---|
+| Lint | `npm run lint` | Pass, no findings |
+| Type check | `npm run typecheck` | Pass |
+| Unit/integration/component tests | `npm test` | Pass: 25 files, 330 tests |
+| Checker-only tests | `npm run test:checker` | Pass: 7 files, 159 tests |
+| Production build (no Supabase env) | `npm run build` | Pass |
+| Runtime dependency audit | `npm audit --omit=dev` | 0 vulnerabilities |
+| Migrations from empty | `npm run db:reset` | Pass: 8 migrations + seed |
+| Database/RLS/checker-contract tests | `npm run db:test` | Pass: 7 files, 211 assertions |
+| Database lint | `npm run db:lint` | Pass: no schema errors |
+| Migration preflight | Read-only local run against the seeded database | 3 monitors, 0 blocking, 0 unexpected error classes |
+
+The TLS tests generate disposable certificates at runtime and add the test CA to the Node trust store without disabling verification. A missing OpenSSL CLI, a Node runtime without the test-CA API, or an environment that cannot bind `::1` causes the affected tests to be reported as skipped/blocked, not passed. No arbitrary external website is used. No remote database was connected to, modified, or reset. Deployment-level egress isolation remains **unverified** and a release blocker for customer checks.
 
 ---
 
@@ -645,9 +664,10 @@ not being executed yet.
 
 **Goal:** execute checks reliably from isolated workers and persist trustworthy results.
 
-**Phase 4A status (2026-10-31): delivered on `phase-4a/safe-http-checker`.** The
-standalone module in `worker/checker/` is independently tested and not imported
-by Next.js. It is not connected to a scheduler, database, or customer monitor.
+**Phase 4A status (2026-11-01): Phase 4A.1 hardening delivered on
+`phase-4a/safe-http-checker`.** The standalone module in `worker/checker/` is
+independently tested and not imported by Next.js. It is not connected to a
+scheduler, database, or customer monitor.
 
 Phase 4A delivered:
 
@@ -669,6 +689,34 @@ Phase 4A delivered:
   coverage for the tightened monitor/result contract.
 - `ROADMAP.md`, `README.md`, `docs/database.md`, and `worker/README.md`
   documentation, including the egress-isolation release blocker.
+
+Phase 4A.1 delivered (2026-11-01):
+
+- An HTTPS monitor may redirect to HTTPS but not downgrade to plaintext HTTP.
+  HTTP-to-HTTPS upgrades and HTTPS-to-HTTPS redirects remain allowed. The rule
+  is applied to every hop and has no monitor or environment opt-out.
+- Bounded address fallback: up to three validated addresses per hostname per
+  hop. Every DNS answer is validated before use. Only pre-response connection
+  refused/failure or timeout is retried; TLS errors and returned HTTP statuses
+  are never retried. The total deadline is unchanged, and each attempt preserves
+  the hostname for the Host header, TLS SNI, and certificate verification.
+- Local TLS coverage with runtime-generated disposable certificates: a trusted
+  test CA, wrong-hostname rejection, self-signed rejection, SNI/Host
+  preservation, IPv6 loopback where available, and a real `checkMonitor` +
+  Undici + local TLS server path. Unsupported environments skip explicitly
+  rather than reporting a false pass.
+- A new migration persists `redirect_count` and `response_bytes`, with
+  non-negative constraints and pgTAP coverage for defaults, rejection of
+  negative values, and tenant isolation.
+- A read-only `supabase/preflight/phase_4a_monitor_compatibility.sql` check for
+  legacy monitor rows that would block the Phase 4A constraints. It reports
+  rows and rolls back; it never deletes, disables, or rewrites monitors.
+- The committed test private key and certificate were removed. Test certificates
+  are generated at runtime. The old key remains in git history at the Phase 4A
+  commit; history was not rewritten, and secret scanners that inspect history
+  may still flag that disposable test key.
+- Documentation updated for fallback, downgrade, metrics, preflight, and the
+  remaining TLS/IPv6/deployment limits.
 
 Deferred to Phase 4B/4C:
 
@@ -704,6 +752,11 @@ Deferred to Phase 4B/4C:
 - [x] **Phase 4A:** timeout, connection refused, DNS failure, TLS failure, status mismatch, redirect loop, blocked target, response too large, unsupported configuration, and internal error produce distinct, sanitized results.
 - [ ] Body-mismatch results are implemented. Phase 4A rejects body assertions as `unsupported_configuration` instead of silently ignoring them.
 - [x] **Phase 4A:** redirects are validated at every hop and cannot reach a private/metadata address.
+- [x] **Phase 4A.1:** an HTTPS monitor cannot be redirected to plaintext HTTP; HTTP-to-HTTPS and HTTPS-to-HTTPS redirects remain allowed, and there is no opt-out.
+- [x] **Phase 4A.1:** a hostname with multiple validated addresses tries at most three, only after a pre-response connection failure/timeout, within the unchanged total deadline; TLS errors and HTTP responses are not retried.
+- [x] **Phase 4A.1:** local trusted-CA, wrong-hostname, self-signed, SNI/Host, and real checker/Undici TLS tests pass where the environment supports them; unsupported cases skip explicitly.
+- [x] **Phase 4A.1:** `redirect_count` and `response_bytes` are persisted by a new migration, constrained to non-negative values, and covered by tenant-isolation pgTAP tests.
+- [x] **Phase 4A.1:** a read-only preflight reports legacy monitors that would block the Phase 4A constraints without deleting, disabling, or rewriting them.
 - [x] **Phase 4A:** the application-level SSRF suite blocks localhost, RFC1918, link-local, IPv6 equivalents, metadata IPs, decimal/hex IP forms, IPv4-compatible/mapped forms, DNS rebinding, and redirect-to-private cases.
 - [ ] **Deployment gate:** the worker host/network enforces egress isolation for private, link-local, loopback, metadata, control-plane, and Supabase private networks. This is a release blocker, not an application-only claim.
 - [x] **Phase 4A:** only ports 80/443 are allowed by default; the checker has no exception path.

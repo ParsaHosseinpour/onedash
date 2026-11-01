@@ -1,27 +1,29 @@
 # Database foundation
 
 This document describes the Phase 2 database model, the Phase 3 monitor
-configuration and development limit, the Phase 4A checker contract, the
-migration workflow, RLS rules, worker role, and known gaps. It reflects the
-code on `phase-4a/safe-http-checker`; it is not a claim that the schema has been
-deployed to a hosted Supabase project.
+configuration and development limit, the Phase 4A.1 checker contract and result
+metrics, the migration workflow and preflight, RLS rules, worker role, and known
+gaps. It reflects the code on `phase-4a/safe-http-checker`; it is not a claim
+that the schema has been deployed to a hosted Supabase project.
 
 ## Status
 
-- Seven versioned migrations live in `supabase/migrations/`.
+- Eight versioned migrations live in `supabase/migrations/`.
 - `supabase db reset` applies all migrations and `supabase/seed.sql` from an
   empty local database.
-- `supabase test db --local` runs 201 pgTAP assertions; all pass on a fresh
+- `supabase test db --local` runs 211 pgTAP assertions; all pass on a fresh
   reset.
 - `supabase db lint --local` reports no schema errors.
 - `supabase/schema.sql` is retained as the Phase 1 historical file. The
   migrations supersede it. Do not apply `schema.sql` after the migrations.
 - Phase 3 adds the monitor management control plane and a database-enforced
   development monitor limit. Phase 4A adds a standalone checker foundation and
-  tightens the stored monitor/result contract. Neither phase adds a scheduler,
-  worker service, result ingestion, or alert delivery, and no outbound customer
-  request is made by the application.
-- No remote project has been linked or pushed. Phase 4B has not started.
+  tightens the stored monitor/result contract. Phase 4A.1 adds redirect-count
+  and response-byte result columns plus a read-only migration preflight. None of
+  these phases adds a scheduler, worker service, result ingestion, or alert
+  delivery, and no outbound customer request is made by the application.
+- No remote project has been linked or pushed. The preflight has only been run
+  against the local seeded database. Phase 4B has not started.
 
 The Phase 1 `schema.sql` and the waitlist migration agree on the table shape,
 constraints, case-insensitive unique index, and `waitlist_count()` definition.
@@ -94,6 +96,10 @@ channels, encrypted placeholder secrets, and an alert delivery.
    (`GET`/`HEAD`, required TLS verification, no body assertions, redirects
    capped at five) and the extended sanitized `check_results.error_class`
    vocabulary.
+8. `20261101090000_check_result_metrics.sql` — Phase 4A.1 non-negative
+   `check_results.redirect_count` (not null, default 0) and nullable
+   `check_results.response_bytes` counters. No body, header, URL, hostname,
+   query string, or secret is added.
 
 ## Entity relationship diagram
 
@@ -336,11 +342,47 @@ The checker independently revalidates these fields and returns
 a migration cannot protect a worker that reads a stale or directly-inserted
 row, and the checker must not silently ignore a configured field.
 
-The checker never writes results in Phase 4A. The `check_results.error_class`
+The checker never writes results in Phase 4A/4A.1. The `check_results.error_class`
 constraint now includes the sanitized Phase 4A classes
 `connection_failure`, `redirect_failure`, `response_too_large`, and
 `unsupported_configuration`, alongside the existing classes. No response body,
 header, URL, query string, or secret is stored in a result.
+
+Phase 4A.1 adds two result counters through
+`20261101090000_check_result_metrics.sql`:
+
+| Column | Rule | Purpose |
+| --- | --- | --- |
+| `redirect_count` | `integer not null default 0`, `>= 0` | Number of redirect hops the checker followed. |
+| `response_bytes` | `integer`, `null` or `>= 0` | Body bytes read and discarded; `null` when no body was read. |
+
+The checker already returns both values in its sanitized result. Persisting them
+does not add ingestion: the Phase 4B result writer still has to store them. The
+migration is additive and does not modify the published Phase 4A migration.
+`007_check_result_metrics.sql` covers stored values, defaults, negative-value
+rejection, and cross-tenant read isolation.
+
+### Migration preflight
+
+The Phase 4A monitor migration (`20261028233000_checker_contract.sql`) can fail
+on legacy Phase 2/3 rows that do not meet the stricter monitor constraints.
+Before applying it to an existing database, run the read-only check:
+
+```bash
+psql "$DATABASE_URL" -f supabase/preflight/phase_4a_monitor_compatibility.sql
+```
+
+It opens a `READ ONLY` transaction with a 30-second statement timeout, reports
+each blocking monitor and reason, summarizes the count, checks
+`check_results.error_class` against the Phase 4A vocabulary, and rolls back. It
+does not delete, disable, rewrite, or migrate any row.
+
+An operator must confirm `blocking_monitors = 0` before applying the migration.
+Review every reported row (method, TLS verification, body assertions, redirect
+budget) and decide remediation with the monitor owner. This round did not run
+the preflight against a remote database and did not auto-fix any monitor. Use a
+database copy or read-only role; do not run it against production without
+explicit approval, and take a backup before any production migration.
 
 ### Limit settings
 
@@ -439,7 +481,8 @@ This is a Phase 4B implementation requirement, not a change made by the Phase
 ## Check-result retention and partitioning plan
 
 `check_results` is append-only and deliberately has no response-body or
-response-header columns. Current indexes:
+response-header columns. It does store the non-sensitive `redirect_count` and
+`response_bytes` counters added by Phase 4A.1. Current indexes:
 
 - `(monitor_id, checked_at desc)` for per-monitor history.
 - `(organization_id, checked_at desc)` for tenant history.
@@ -482,8 +525,11 @@ The pgTAP suite is in `supabase/tests/database/`:
 - `006_checker_contract.sql` — Phase 4A monitor restrictions (`GET`/`HEAD`,
   required TLS verification, no body assertions, redirect cap) and the extended
   `check_results.error_class` vocabulary.
+- `007_check_result_metrics.sql` — Phase 4A.1 `redirect_count` and
+  `response_bytes` storage, defaults, non-negative constraints, and tenant
+  isolation.
 
-The suite currently has **201 assertions across six files**.
+The suite currently has **211 assertions across seven files**.
 
 Run:
 
@@ -514,10 +560,10 @@ test-specific slugs and IDs so seed data does not make counts ambiguous.
    Supabase project. Do not run `supabase db push` against production without
    review and a backup.
 6. **No scheduler, worker service, or result ingestion.** Phase 3 defines and
-   manages the configuration contract; Phase 4A adds a standalone checker
-   module. There is no test-check action, scheduler, outbound request from the
-   app, result persistence, or alert delivery. Do not describe checks as
-   running.
+   manages the configuration contract; Phase 4A.1 adds a standalone checker
+   module and result-metric columns. There is no test-check action, scheduler,
+   outbound request from the app, result writer, or alert delivery. Do not
+   describe checks as running.
 7. **Egress isolation is not implemented by this repository.** The checker
    rejects non-public addresses and pins validated DNS answers, but application
    validation alone is not sufficient. The worker host/network must deny
@@ -535,3 +581,7 @@ test-specific slugs and IDs so seed data does not make counts ambiguous.
 11. **Service-role scope is minimal.** It can INSERT waitlist rows and has the
     default non-DML grants, but it cannot SELECT waitlist rows. Future server
     features need explicit, reviewed grants.
+12. **The Phase 4A preflight is local-only so far.** It was run against the
+    seeded local database (3 monitors, 0 blocking, 0 unexpected error classes).
+    It has not been run against a remote or production database, and no remote
+    database has been linked, modified, or reset.
