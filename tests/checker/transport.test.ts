@@ -1,23 +1,45 @@
-import { readFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
-import { join } from "node:path";
 import tls from "node:tls";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+} from "vitest";
 import {
   createUndiciTransport,
   type HttpRequestInput,
 } from "../../worker/checker/transport";
+import {
+  canGenerateTestCertificates,
+  canTrustTestCertificateAuthority,
+  createTestTlsFixtures,
+  TEST_TLS_HOSTNAME,
+  TEST_TLS_WRONG_HOSTNAME,
+  trustTestCertificateAuthority,
+  type TestTlsFixtures,
+} from "./tls-fixtures";
 
-const key = readFileSync(
-  join(process.cwd(), "tests", "checker", "fixtures", "checker-test-key.pem"),
-  "utf8",
-);
-const cert = readFileSync(
-  join(process.cwd(), "tests", "checker", "fixtures", "checker-test-cert.pem"),
-  "utf8",
-);
+const tlsFixturesAvailable =
+  canGenerateTestCertificates() && canTrustTestCertificateAuthority();
+
+let tlsFixtures: TestTlsFixtures | null = null;
+let restoreTrustStore: (() => void) | null = null;
+
+beforeAll(() => {
+  if (!tlsFixturesAvailable) return;
+  tlsFixtures = createTestTlsFixtures();
+  restoreTrustStore = trustTestCertificateAuthority(tlsFixtures.caCert);
+});
+
+afterAll(() => {
+  restoreTrustStore?.();
+  tlsFixtures?.cleanup();
+});
 
 const servers: Array<net.Server> = [];
 
@@ -28,11 +50,14 @@ afterEach(async () => {
   }
 });
 
-async function listen(server: net.Server): Promise<number> {
+async function listen(
+  server: net.Server,
+  host = "127.0.0.1",
+): Promise<number> {
   servers.push(server);
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
+    server.listen(0, host, () => resolve());
   });
   const address = server.address();
   if (!address || typeof address === "string") {
@@ -221,21 +246,74 @@ describe("Undici pinned transport", () => {
     }
   });
 
-  it("keeps TLS verification enabled and preserves SNI", async () => {
+  it("accepts a trusted test certificate and verifies the hostname and SNI", async (context) => {
+    if (!tlsFixtures) {
+      console.warn(
+        "TLS fixture test blocked: OpenSSL or a test-CA-capable Node runtime is unavailable.",
+      );
+      context.skip();
+      return;
+    }
+
     let seenServername: string | undefined;
-    const context = tls.createSecureContext({ key, cert });
+    const secureContext = tls.createSecureContext({
+      key: tlsFixtures.serverKey,
+      cert: tlsFixtures.serverCert,
+    });
     const server = https.createServer(
       {
-        key,
-        cert,
+        key: tlsFixtures.serverKey,
+        cert: tlsFixtures.serverCert,
         SNICallback: (servername, callback) => {
           seenServername = servername;
-          callback(null, context);
+          callback(null, secureContext);
         },
       },
       (_req, res) => {
         res.writeHead(200);
         res.end("ok");
+      },
+    );
+    const port = await listen(server);
+    const transport = createUndiciTransport();
+
+    const result = await transport.request(
+      request(`https://${TEST_TLS_HOSTNAME}:${port}/`, {
+        tlsServername: TEST_TLS_HOSTNAME,
+      }),
+    );
+
+    expect(result.statusCode).toBe(200);
+    expect(result.bytesRead).toBe(2);
+    expect(seenServername).toBe(TEST_TLS_HOSTNAME);
+  });
+
+  it("rejects a trusted CA certificate issued for the wrong hostname", async (context) => {
+    if (!tlsFixtures) {
+      console.warn(
+        "TLS fixture test blocked: OpenSSL or a test-CA-capable Node runtime is unavailable.",
+      );
+      context.skip();
+      return;
+    }
+
+    let seenServername: string | undefined;
+    const secureContext = tls.createSecureContext({
+      key: tlsFixtures.wrongHostKey,
+      cert: tlsFixtures.wrongHostCert,
+    });
+    const server = https.createServer(
+      {
+        key: tlsFixtures.wrongHostKey,
+        cert: tlsFixtures.wrongHostCert,
+        SNICallback: (servername, callback) => {
+          seenServername = servername;
+          callback(null, secureContext);
+        },
+      },
+      (_req, res) => {
+        res.writeHead(200);
+        res.end("wrong host");
       },
     );
     server.on("tlsClientError", () => undefined);
@@ -244,8 +322,8 @@ describe("Undici pinned transport", () => {
 
     await expect(
       transport.request(
-        request(`https://checker.test:${port}/`, {
-          tlsServername: "checker.test",
+        request(`https://${TEST_TLS_HOSTNAME}:${port}/`, {
+          tlsServername: TEST_TLS_HOSTNAME,
         }),
       ),
     ).rejects.toMatchObject({
@@ -253,7 +331,88 @@ describe("Undici pinned transport", () => {
       kind: "tls_error",
     });
 
-    expect(seenServername).toBe("checker.test");
+    expect(seenServername).toBe(TEST_TLS_HOSTNAME);
+    expect(TEST_TLS_WRONG_HOSTNAME).not.toBe(TEST_TLS_HOSTNAME);
+  });
+
+  it("rejects a self-signed certificate while preserving SNI", async (context) => {
+    if (!tlsFixtures) {
+      console.warn(
+        "TLS fixture test blocked: OpenSSL or a test-CA-capable Node runtime is unavailable.",
+      );
+      context.skip();
+      return;
+    }
+
+    let seenServername: string | undefined;
+    const secureContext = tls.createSecureContext({
+      key: tlsFixtures.selfSignedKey,
+      cert: tlsFixtures.selfSignedCert,
+    });
+    const server = https.createServer(
+      {
+        key: tlsFixtures.selfSignedKey,
+        cert: tlsFixtures.selfSignedCert,
+        SNICallback: (servername, callback) => {
+          seenServername = servername;
+          callback(null, secureContext);
+        },
+      },
+      (_req, res) => {
+        res.writeHead(200);
+        res.end("self signed");
+      },
+    );
+    server.on("tlsClientError", () => undefined);
+    const port = await listen(server);
+    const transport = createUndiciTransport();
+
+    await expect(
+      transport.request(
+        request(`https://${TEST_TLS_HOSTNAME}:${port}/`, {
+          tlsServername: TEST_TLS_HOSTNAME,
+        }),
+      ),
+    ).rejects.toMatchObject({
+      name: "TransportError",
+      kind: "tls_error",
+    });
+
+    expect(seenServername).toBe(TEST_TLS_HOSTNAME);
+  });
+
+  it("connects over IPv6 loopback when the environment supports it", async (context) => {
+    const probe = net.createServer();
+    const ipv6Available = await new Promise<boolean>((resolve) => {
+      probe.once("error", () => resolve(false));
+      probe.listen(0, "::1", () => resolve(true));
+    });
+    await closeServer(probe).catch(() => undefined);
+
+    if (!ipv6Available) {
+      console.warn("IPv6 loopback is unavailable; the IPv6 transport test is blocked.");
+      context.skip();
+      return;
+    }
+
+    let hostHeader: string | undefined;
+    const server = http.createServer((req, res) => {
+      hostHeader = req.headers.host;
+      res.writeHead(200);
+      res.end("ipv6");
+    });
+    const port = await listen(server, "::1");
+    const transport = createUndiciTransport();
+
+    const result = await transport.request(
+      request(`http://checker.test:${port}/ipv6`, {
+        pinnedAddress: { address: "::1", family: 6 },
+      }),
+    );
+
+    expect(result.statusCode).toBe(200);
+    expect(result.bytesRead).toBe(4);
+    expect(hostHeader).toBe(`checker.test:${port}`);
   });
 
   it("aborts an in-flight request and does not leak a result", async () => {

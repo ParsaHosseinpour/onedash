@@ -22,8 +22,14 @@
 
 # misc
 .DS_Store
+
+# Never commit generated private keys or certificates. Checker TLS fixtures are
+# generated in the OS temporary directory during the test run.
 *.pem
-!tests/checker/fixtures/*.pem
+*.key
+*.crt
+*.csr
+*.srl
 
 # debug
 npm-debug.log*
