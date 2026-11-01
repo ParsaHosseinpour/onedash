@@ -406,8 +406,8 @@ Verified locally on 2026-11-01:
 | --- | --- |
 | `npm run lint` | Pass, no findings |
 | `npm run typecheck` | Pass |
-| `npm test` | 330 tests across 25 files pass |
-| `npm run test:checker` | 159 checker tests across 7 files pass |
+| `npm test` | 331 tests across 25 files pass |
+| `npm run test:checker` | 160 checker tests across 7 files pass |
 | `npm run build` (no Supabase env) | Pass |
 | `npm audit --omit=dev` | 0 vulnerabilities |
 | `npm run db:reset` | 8 migrations + seed pass |

@@ -615,6 +615,30 @@ describe("checkMonitor", () => {
     expect(transport.calls).toHaveLength(1);
   });
 
+  it("does not retry a TLS verification failure on another address", async () => {
+    const dns = new FakeDnsResolver(() => [
+      resolved(PUBLIC_IPV4),
+      resolved("8.8.8.8"),
+    ]);
+    const transport = new FakeTransport((_input, index) => {
+      if (index === 0) {
+        throw new TransportError("tls_error");
+      }
+      return transportResponse({ statusCode: 200 });
+    });
+
+    const result = await checkMonitor(baseConfig(), {
+      dnsResolver: dns,
+      transport,
+      limits: { maxAddressAttempts: 2 },
+    });
+
+    expect(result.status).toBe("error");
+    expect(result.errorClass).toBe("tls_error");
+    expect(result.httpStatus).toBeNull();
+    expect(transport.calls).toHaveLength(1);
+  });
+
   it("does not extend the total deadline while trying another address", async () => {
     const dns = new FakeDnsResolver(() => [
       resolved(PUBLIC_IPV4),

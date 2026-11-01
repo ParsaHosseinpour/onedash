@@ -69,8 +69,8 @@ Phase 4A.1 was verified locally with Supabase CLI 2.122.0, Docker Desktop, and N
 |---|---|---|
 | Lint | `npm run lint` | Pass, no findings |
 | Type check | `npm run typecheck` | Pass |
-| Unit/integration/component tests | `npm test` | Pass: 25 files, 330 tests |
-| Checker-only tests | `npm run test:checker` | Pass: 7 files, 159 tests |
+| Unit/integration/component tests | `npm test` | Pass: 25 files, 331 tests |
+| Checker-only tests | `npm run test:checker` | Pass: 7 files, 160 tests |
 | Production build (no Supabase env) | `npm run build` | Pass |
 | Runtime dependency audit | `npm audit --omit=dev` | 0 vulnerabilities |
 | Migrations from empty | `npm run db:reset` | Pass: 8 migrations + seed |
