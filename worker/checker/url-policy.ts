@@ -25,6 +25,7 @@ export type ValidatedTarget = {
 const CONTROL_OR_SPACE = /[\u0000-\u0020\u007f]/;
 const LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 const NUMERIC_HOST = /^[0-9.]+$/;
+const DEFAULT_ALLOWED_PORTS: readonly number[] = Object.freeze([80, 443]);
 
 const BLOCKED_HOST_SUFFIXES = [
   "localhost",
@@ -80,13 +81,26 @@ function normalizeHostname(hostname: string): string {
   return stripIpv6Brackets(hostname).replace(/\.$/, "");
 }
 
-function allowedPort(url: URL): number {
+function selectAllowedPorts(
+  allowedPorts: readonly number[],
+): readonly number[] {
+  if (process.env.NODE_ENV === "test") return allowedPorts;
+  if (allowedPorts !== DEFAULT_ALLOWED_PORTS) {
+    throw new Error("custom checker ports are test-only");
+  }
+  return DEFAULT_ALLOWED_PORTS;
+}
+
+function allowedPort(
+  url: URL,
+  allowedPorts: readonly number[],
+): number {
   if (!url.port) {
     return url.protocol === "https:" ? 443 : 80;
   }
 
   const port = Number(url.port);
-  if (port !== 80 && port !== 443) unsupported();
+  if (!allowedPorts.includes(port)) unsupported();
   return port;
 }
 
@@ -97,7 +111,9 @@ function allowedPort(url: URL): number {
 export function validateTargetUrl(
   raw: string,
   limits: CheckerLimits,
+  allowedPorts: readonly number[] = DEFAULT_ALLOWED_PORTS,
 ): ValidatedTarget {
+  const ports = selectAllowedPorts(allowedPorts);
   if (typeof raw !== "string") unsupported();
   if (raw.length < 8 || raw.length > limits.maxUrlLength) unsupported();
   if (raw !== raw.trim()) unsupported();
@@ -126,7 +142,7 @@ export function validateTargetUrl(
     validateHostname(hostname);
   }
 
-  const port = allowedPort(url);
+  const port = allowedPort(url, ports);
 
   // Remove a trailing dot and the fragment. The fragment is never sent and
   // must not create a distinct loop-detection key.
@@ -155,6 +171,7 @@ export function parseRedirectTarget(
   location: string | null,
   base: URL,
   limits: CheckerLimits,
+  allowedPorts: readonly number[] = DEFAULT_ALLOWED_PORTS,
 ): ValidatedTarget {
   if (!location) {
     throw new RedirectError("redirect_failure");
@@ -175,10 +192,21 @@ export function parseRedirectTarget(
     throw new RedirectError("redirect_failure");
   }
 
+  let target: ValidatedTarget;
   try {
-    return validateTargetUrl(next.toString(), limits);
+    target = validateTargetUrl(next.toString(), limits, allowedPorts);
   } catch (error) {
     if (error instanceof UnsafeTargetError) throw error;
     throw new RedirectError("redirect_failure");
   }
+
+  // An HTTPS check must never be silently downgraded to plaintext HTTP. This
+  // is checked on every hop, so a chain cannot bypass it by starting with an
+  // HTTPS-to-HTTPS redirect. There is intentionally no monitor option to
+  // disable this protection.
+  if (base.protocol === "https:" && target.url.protocol === "http:") {
+    throw new RedirectError("redirect_failure");
+  }
+
+  return target;
 }

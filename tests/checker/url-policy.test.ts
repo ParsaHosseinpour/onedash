@@ -120,11 +120,35 @@ describe("target URL policy", () => {
     );
   });
 
+  it("rejects an HTTPS-to-HTTP redirect downgrade by default", () => {
+    const base = valid("https://example.com/start").url;
+    expect(() =>
+      parseRedirectTarget("http://example.com/plain", base, limits),
+    ).toThrow(RedirectError);
+    expect(() =>
+      parseRedirectTarget("//example.com/plain", valid("http://example.com/start").url, limits),
+    ).not.toThrow();
+  });
+
+  it("allows HTTP-to-HTTPS upgrades and HTTPS-to-HTTPS redirects", () => {
+    const httpBase = valid("http://example.com/start").url;
+    const httpsBase = valid("https://example.com/start").url;
+
+    expect(
+      parseRedirectTarget("https://example.com/secure", httpBase, limits)
+        .canonical,
+    ).toBe("https://example.com/secure");
+    expect(
+      parseRedirectTarget("https://other.example/secure", httpsBase, limits)
+        .canonical,
+    ).toBe("https://other.example/secure");
+  });
+
   it("rejects unsafe redirect targets with the right class", () => {
     const base = valid("https://example.com/start").url;
 
     const privateRedirect = parseRedirectTarget(
-      "http://127.0.0.1/",
+      "https://127.0.0.1/",
       base,
       limits,
     );
