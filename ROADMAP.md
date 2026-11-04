@@ -1,11 +1,11 @@
 # OneDash Roadmap
 
-**Status:** Phase 4A.1 reliability and TLS hardening implemented on `phase-4a/safe-http-checker` — 2026-11-01. Phase 3 monitor configuration remains verified. Phase 4A.1 adds HTTPS-downgrade rejection, bounded validated-address fallback, local trusted-TLS tests, persisted redirect/response-size metrics, a read-only migration preflight, and removal of the committed test private key. The checker is standalone and independently tested, but it is **not wired to a scheduler or database**: there is no worker service, test-check action, result ingestion, alert delivery, or customer check. Phase 4B (scheduling, worker service, ingestion, regions, metrics) has not started. Hosting egress isolation is an explicit release blocker for customer checks.
+**Status:** Phase 4B scheduler, durable queue, separate worker service, and restricted result ingestion implemented on `phase-4b/scheduler-worker` - 2026-11-04. Phase 4A.1 checker and Phase 3 control plane remain verified. Phase 4B adds a PostgreSQL job queue, fixture-only scheduling/execution, lease/retry/dead-letter handling, split scheduler/queue/ingestor roles, idempotent ingestion, metrics, and multi-connection tests. Customer monitoring is **not active**: the execution gate is disabled by default and both the scheduler and worker refuse customer mode. Multi-region execution, alert delivery, and deployment egress isolation remain unimplemented; egress isolation is a release blocker for customer checks.
 **First release scope:** real HTTP/HTTPS uptime monitoring
 **Phase 0 rule (historical):** audit only. No application behavior, SQL schema, dependency, or deployment configuration was changed.
 **Phase 2 rule:** database foundation only. No monitor UI, scheduler, checker, alert sender, deployment, or remote `db push` was added.
 
-OneDash is currently a Next.js marketing site with a Supabase waitlist, a cookie-based auth foundation, a versioned tenant-safe database schema, an authenticated monitor-configuration control plane, and a standalone Phase 4A.1 checker foundation. It is **not yet an uptime monitor**: no customer check is scheduled or executed, and there is no scheduler, worker service, result ingestion, or alert delivery. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
+OneDash is currently a Next.js marketing site with a Supabase waitlist, a cookie-based auth foundation, a versioned tenant-safe database schema, an authenticated monitor-configuration control plane, a standalone Phase 4A.1 checker, and a Phase 4B fixture-only scheduler/worker/ingestion foundation. It is **not yet an uptime monitor for customers**: no customer check is scheduled or executed, and there is no alert delivery or production egress isolation. The phases below are ordered so that authentication, tenant isolation, and outbound-request safety are fixed before monitoring is built.
 
 ## Verification snapshot (2026-10-28)
 
@@ -80,6 +80,36 @@ Phase 4A.1 was verified locally with Supabase CLI 2.122.0, Docker Desktop, and N
 
 The TLS tests generate disposable certificates at runtime and add the test CA to the Node trust store without disabling verification. A missing OpenSSL CLI, a Node runtime without the test-CA API, or an environment that cannot bind `::1` causes the affected tests to be reported as skipped/blocked, not passed. No arbitrary external website is used. No remote database was connected to, modified, or reset. Deployment-level egress isolation remains **unverified** and a release blocker for customer checks.
 
+## Phase 4B verification snapshot (2026-11-04)
+
+Phase 4B was verified locally with Supabase CLI 2.122.0, Docker Desktop, and
+Node 24. It uses a local disposable database only; no remote project was linked
+or modified.
+
+| Check | Command | Actual result |
+|---|---|---|
+| Lint | `npm run lint` | Pass, no findings |
+| Type check | `npm run typecheck` | Pass |
+| Unit/integration/component tests | `npm test` | Pass: 32 files, 390 tests |
+| Checker-only tests | `npm run test:checker` | Pass: 7 files, 160 tests |
+| Worker/scheduler tests | `npm run test:worker` | Pass: 7 files, 59 tests |
+| Scheduler-only tests | `npm run test:scheduler` | Pass: 1 file, 5 tests |
+| Phase 4B database pipeline | `npm run test:phase4b` | Pass: 1 file, 9 tests, four restricted-role connections |
+| Production build (no Supabase env) | `npm run build` | Pass |
+| Worker build | `npm run worker:build` | Pass |
+| Runtime dependency audit | `npm audit --omit=dev` | 0 vulnerabilities |
+| Migrations from empty | `npm run db:reset` | Pass: 9 migrations + seed |
+| Database/RLS/queue/permission tests | `npm run db:test` | Pass: 8 files, 276 assertions |
+| Database lint | `npm run db:lint` | Pass: no schema errors |
+
+The Phase 4B pipeline test creates disposable `onedash_test_*` login roles and
+uses four restricted-role database connections. It verifies concurrent scheduler
+safety, queue idempotency, leases, retries, dead-lettering, expired-lease
+recovery, restricted ingestion, monitor-state updates, the execution gate,
+fixture allowlisting, aggregate metrics, permission denial, and an end-to-end
+worker runtime pass through the restricted queue and ingestor clients. It does
+not perform an arbitrary external check. Customer execution remains disabled.
+
 ---
 
 ## 1. Executive summary
@@ -91,22 +121,24 @@ The TLS tests generate disposable certificates at runtime and add the test CA to
 - Supabase email/password signup and login UI with cookie-based SSR sessions.
 - A server-side email-confirmation callback (`/auth/callback`).
 - A protected `/dashboard` with tenant-scoped monitor configuration: list, detail, create, edit, pause/resume, and delete.
-- A standalone Phase 4A HTTP/HTTPS checker foundation with SSRF/DNS-rebinding defenses and independent tests; it is not wired to the app.
+- A standalone Phase 4A HTTP/HTTPS checker foundation with SSRF/DNS-rebinding defenses and independent tests.
+- A Phase 4B fixture-only scheduler, durable PostgreSQL queue, separate worker service, restricted result ingestor, split database roles, metrics, and multi-connection tests.
 - Versioned migrations, RLS, seed data, pgTAP database tests, Vitest tests, and CI.
 
 ### What does not exist
 
-- Scheduler, worker service, check-result ingestion, customer checks, alert delivery, operational incident/status-page management, teams/invitations, billing, or public APIs. The Phase 4A checker module exists but is not connected to any of these.
+- Customer checks, alert delivery, operational incident/status-page management, teams/invitations, billing, or public APIs. Phase 4B stores fixture results only; it does not create incidents or notifications.
+- Multi-region execution, confirmation/quorum policy, or a hosted production data plane with enforced worker egress isolation.
 - Automated Playwright auth or monitor E2E coverage.
-- A deployed, production-ready data plane with enforced worker egress isolation.
 
 ### Release-blocking findings (Phase 0 baseline; see status above)
 
 > Items 1–3 were addressed in Phase 1. They are retained as historical audit
-> findings. Item 4 is only partially addressed: Phase 4A adds a tested checker
-> foundation, but the scheduler, worker service, ingestion, and enforced egress
-> isolation are still absent. Item 5 remains true for the unimplemented
-> monitoring, alerting, and status-page claims.
+> findings. Item 4 is partially addressed: Phase 4A adds a tested checker, and
+> Phase 4B adds a fixture-only scheduler, queue, worker service, and ingestion.
+> Enforced egress isolation and customer activation remain absent, so item 4 is
+> still a release blocker. Item 5 remains true for the unimplemented alerting
+> and status-page claims.
 
 1. **Authentication is inconsistent and likely broken in a clean browser.** The browser client uses `@supabase/supabase-js` (`localStorage` session), while the server and middleware use `@supabase/ssr` cookie sessions. Password login does not create the cookies the server reads, and logout does not clear server cookies. See §5.1.
 2. **`next@16.2.10` has a critical security advisory.** `npm audit` recommends `next@16.4.3` or later. See §4.
@@ -664,10 +696,12 @@ not being executed yet.
 
 **Goal:** execute checks reliably from isolated workers and persist trustworthy results.
 
-**Phase 4A status (2026-11-01): Phase 4A.1 hardening delivered on
-`phase-4a/safe-http-checker`.** The standalone module in `worker/checker/` is
-independently tested and not imported by Next.js. It is not connected to a
-scheduler, database, or customer monitor.
+**Phase 4A/4B status (2026-11-04): Phase 4B fixture-only scheduler, queue,
+worker, and ingestion delivered on `phase-4b/scheduler-worker`.** The standalone
+checker in `worker/checker/` remains independently tested. The new scheduler
+and worker are separate Node processes; the checker module still has no database
+client. Customer monitoring is not active: the execution gate is disabled by
+default and both the scheduler and worker refuse customer mode.
 
 Phase 4A delivered:
 
@@ -718,16 +752,42 @@ Phase 4A.1 delivered (2026-11-01):
 - Documentation updated for fallback, downgrade, metrics, preflight, and the
   remaining TLS/IPv6/deployment limits.
 
-Deferred to Phase 4B/4C:
+Phase 4B delivered (2026-11-04):
 
-- Dockerized worker service, bounded DB connections, graceful shutdown, and
-  heartbeat.
-- Scheduler queueing, per-region jobs, idempotency keys, leases, jitter,
-  retries, dead-letter handling, and result persistence.
+- A durable PostgreSQL job table (`check_jobs`) with unique idempotency keys,
+  unique `(monitor, region, scheduled slot)` rows, safe `FOR UPDATE SKIP
+  LOCKED` claiming, lease tokens, exponential backoff, maximum attempts,
+  dead-letter state, and expired-lease recovery.
+- A long-lived scheduler with active/due-monitor filtering, operator fixture
+  allowlisting, UTC slots, deterministic jitter, multi-scheduler row locks,
+  safe `next_run_at` advancement, missed-slot skipping, and heartbeat/metrics.
+- A separate worker service with bounded concurrency, lease extension,
+  graceful shutdown, `/healthz`, `/readyz`, `/metrics`, and no customer URL or
+  secret logging.
+- Restricted result ingestion that validates a strict payload, derives tenant
+  and monitor identity from the job row, stores checker results idempotently,
+  updates `monitor_state` only for newer results, and completes the job in one
+  transaction. Fixture output is synthetic test data for `.test` monitors, not
+  customer uptime. It creates no incidents or notifications.
+- Split NOLOGIN group roles `onedash_scheduler`, `onedash_queue`, and
+  `onedash_ingestor`, with fixed-search-path `SECURITY DEFINER` functions and
+  no direct table access. The legacy `onedash_worker` role has all grants and
+  policies revoked.
+- A default-disabled execution gate and operator fixture allowlist. The
+  scheduler and claim function refuse `customer` mode even if the gate is
+  changed.
+- Scheduler, queue, worker, ingestion, permission, and multi-connection
+  pipeline tests. The pipeline test uses four restricted-role
+  connections and does not call an arbitrary external website.
+- Documentation for the queue decision, permissions, metrics, activation
+  prerequisites, and remaining egress blocker.
+
+Deferred to Phase 4C/5:
+
 - Request headers/bodies/secrets, body assertions, certificate-expiry capture,
   and latency-threshold evaluation.
-- Two or more regions, confirmation/quorum policy, worker metrics, load tests,
-  and runbook.
+- Two or more regions, confirmation/quorum policy, load tests, and runbook.
+- Alert delivery, incidents, and operational status-page management.
 - Deployment-level egress isolation. Application validation is not sufficient;
   the worker host/network must deny private, link-local, loopback, metadata,
   control-plane, and Supabase private-network egress. If the hosting environment
@@ -735,20 +795,26 @@ Deferred to Phase 4B/4C:
 
 **Work remaining for the full phase**
 
-- Create a standalone worker service (TypeScript/Node, Dockerized) with bounded DB connections and graceful shutdown.
-- Implement scheduler queueing with per-region jobs, unique idempotency keys, leases, jitter, retries, dead-letter handling, and heartbeat.
-- Extend the Phase 4A checker with the deferred request configuration and result persistence.
-- Enforce egress isolation in the worker deployment.
-- Persist results with region, attempt, timings, status, and sanitized error class. Make writes idempotent.
-- Add at least two regions and a configurable confirmation/quorum policy.
-- Add worker metrics: checks attempted/succeeded/failed, duration, scheduler lag, queue depth, heartbeat, and dead-letter count.
-- Add capacity/load tests and a worker runbook.
+- [x] Create a standalone worker service (TypeScript/Node) with bounded DB connections and graceful shutdown. Docker packaging is still deferred.
+- [x] Implement scheduler queueing with per-region jobs, unique idempotency keys, leases, jitter, retries, dead-letter handling, and heartbeat.
+- [x] Persist results with region, timings, status, sanitized error class, and idempotency. The job row supplies tenant/monitor identity.
+- [x] Add worker metrics for claims, completions, failures, retries, duration, queue depth, heartbeat, and dead-letter count.
+- [ ] Extend the checker with the deferred request configuration, body assertions, and latency-threshold evaluation.
+- [ ] Enforce egress isolation in the worker deployment.
+- [ ] Add at least two regions and a configurable confirmation/quorum policy.
+- [ ] Add capacity/load tests and a worker runbook.
+- [ ] Implement the customer scheduling/claim path and obtain approval before changing the execution gate.
 
 **Acceptance criteria**
 
 - [ ] A monitor configured at a 5-minute interval is checked close to schedule; scheduler lag p95 is measured and within the agreed target (proposed: ≤15 seconds).
-- [ ] Duplicate jobs for the same monitor/region/scheduled time produce one idempotent result.
-- [ ] Killing a worker mid-check loses no acknowledged job; leases expire and work is retried.
+- [x] **Phase 4B:** duplicate jobs for the same monitor/region/scheduled time produce one idempotent result. Covered by unique constraints and the database pipeline test.
+- [x] **Phase 4B:** killing a worker mid-check loses no acknowledged job; leases expire and work is retried or dead-lettered. Covered by the lease-expiry and retry tests.
+- [x] **Phase 4B:** the scheduler only schedules active, due, operator-allowlisted fixtures; multiple schedulers are safe; UTC slots and deterministic jitter are used; missed downtime slots are skipped.
+- [x] **Phase 4B:** split scheduler/queue/ingestor permissions are enforced through restricted `SECURITY DEFINER` functions; direct table access and the legacy worker role are denied.
+- [x] **Phase 4B:** checker results are persisted idempotently, monitor state is updated only for newer results, and no incidents or notifications are fabricated. Fixture results are synthetic `.test` data, not customer uptime.
+- [x] **Phase 4B:** the execution gate is disabled by default; the scheduler and worker refuse customer mode; fixture mode requires both a database allowlist and a worker host allowlist.
+- [x] **Phase 4B:** scheduler/worker heartbeats, queue depth/age, scheduler ticks, completed/failed/retried jobs, expired leases, check duration, timeouts, and concurrency are exposed through health/metrics endpoints or the aggregate queue metrics function.
 - [x] **Phase 4A:** timeout, connection refused, DNS failure, TLS failure, status mismatch, redirect loop, blocked target, response too large, unsupported configuration, and internal error produce distinct, sanitized results.
 - [ ] Body-mismatch results are implemented. Phase 4A rejects body assertions as `unsupported_configuration` instead of silently ignoring them.
 - [x] **Phase 4A:** redirects are validated at every hop and cannot reach a private/metadata address.
@@ -763,10 +829,10 @@ Deferred to Phase 4B/4C:
 - [x] **Phase 4A:** response bodies are not stored; checker results contain no URL, hostname, query, headers, body, cookies, or secrets.
 - [ ] At least two regions return tagged results; the confirmation policy is documented and testable.
 - [ ] A load test for the agreed initial capacity (for example, 1,000 monitors at a 5-minute interval) meets the lag/duration targets.
-- [ ] Worker heartbeat, scheduler lag, queue depth, and failure metrics are visible.
+- [x] **Phase 4B:** worker heartbeat, scheduler tick/heartbeat, queue depth/age, expired leases, and failure metrics are visible. Scheduler lag p95 against customer monitors is still unmeasured.
 - [x] **Phase 4A:** the checker does not run inside Vercel request handlers or rely on serverless cron as its only scheduler.
 
-**Exit gate:** checks are reliable, isolated, and safe enough to enable for internal test monitors. Phase 4A clears the checker-foundation portion only; the scheduler, persistence, regions, metrics, and deployment egress gate remain unmet, so the full exit gate is not cleared.
+**Exit gate:** checks are reliable, isolated, and safe enough to enable for internal test monitors. Phase 4A clears the checker-foundation portion. Phase 4B clears the local fixture scheduler, queue, worker, idempotent ingestion, split-permission, and metrics portions. Customer activation is still blocked by the unverified deployment egress gate, missing multi-region/quorum policy, missing customer scheduling path, and absent load/runbook evidence, so the full exit gate is not cleared.
 
 ---
 
@@ -936,7 +1002,7 @@ These are targets to validate in Phase 4/7, not current behavior.
 ### Open decisions
 
 - Worker host and initial regions (Fly.io, Railway, Render, AWS, etc.).
-- Queue choice: Postgres-backed (pg-boss/Graphile Worker) vs Redis/BullMQ.
+- Queue choice: **decided for Phase 4B** - a PostgreSQL job table with safe transactional claiming. PGMQ 1.5.1 was available locally but not installed and lacked the required built-in idempotency dedupe, retry/backoff policy, terminal states, and simple restricted-role auditing. Revisit Redis/BullMQ only if scale or multi-region routing requires it.
 - Free-plan limits: monitors, minimum interval, retention, alert channels.
 - Confirmation policy: consecutive failures, multi-region quorum, or both; default for free vs paid.
 - Whether email/password remains the only auth method at launch; MFA/password reset timing.

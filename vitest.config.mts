@@ -13,6 +13,7 @@ export default defineConfig({
     environment: "node",
     globals: true,
     include: ["tests/**/*.test.{ts,tsx}"],
+    exclude: ["tests/phase4b/**"],
     setupFiles: ["./vitest.setup.ts"],
     restoreMocks: true,
     clearMocks: true,

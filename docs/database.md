@@ -2,28 +2,33 @@
 
 This document describes the Phase 2 database model, the Phase 3 monitor
 configuration and development limit, the Phase 4A.1 checker contract and result
-metrics, the migration workflow and preflight, RLS rules, worker role, and known
-gaps. It reflects the code on `phase-4a/safe-http-checker`; it is not a claim
-that the schema has been deployed to a hosted Supabase project.
+metrics, the Phase 4B scheduler/queue/ingestion foundation, the migration
+workflow and preflight, RLS rules, split data-plane roles, and known gaps. It
+reflects the code on `phase-4b/scheduler-worker`; it is not a claim that the
+schema has been deployed to a hosted Supabase project.
 
 ## Status
 
-- Eight versioned migrations live in `supabase/migrations/`.
+- Nine versioned migrations live in `supabase/migrations/`.
 - `supabase db reset` applies all migrations and `supabase/seed.sql` from an
   empty local database.
-- `supabase test db --local` runs 211 pgTAP assertions; all pass on a fresh
-  reset.
+- `supabase test db --local` runs 276 pgTAP assertions across eight files; all
+  pass on a fresh reset.
 - `supabase db lint --local` reports no schema errors.
 - `supabase/schema.sql` is retained as the Phase 1 historical file. The
   migrations supersede it. Do not apply `schema.sql` after the migrations.
 - Phase 3 adds the monitor management control plane and a database-enforced
   development monitor limit. Phase 4A adds a standalone checker foundation and
   tightens the stored monitor/result contract. Phase 4A.1 adds redirect-count
-  and response-byte result columns plus a read-only migration preflight. None of
-  these phases adds a scheduler, worker service, result ingestion, or alert
-  delivery, and no outbound customer request is made by the application.
+  and response-byte result columns plus a read-only migration preflight. Phase
+  4B adds a scheduler, a durable PostgreSQL job table, a separate worker
+  service, restricted ingestion, split database roles, and metrics.
+- Phase 4B is **not activated for customers**. The database execution gate is
+  `disabled` by default, the scheduler only queues operator-allowlisted
+  fixtures, and the worker refuses `customer` mode. No alert delivery or
+  incident automation is added.
 - No remote project has been linked or pushed. The preflight has only been run
-  against the local seeded database. Phase 4B has not started.
+  against the local seeded database.
 
 The Phase 1 `schema.sql` and the waitlist migration agree on the table shape,
 constraints, case-insensitive unique index, and `waitlist_count()` definition.
@@ -100,6 +105,11 @@ channels, encrypted placeholder secrets, and an alert delivery.
    `check_results.redirect_count` (not null, default 0) and nullable
    `check_results.response_bytes` counters. No body, header, URL, hostname,
    query string, or secret is added.
+9. `20261102090000_scheduler_queue_ingestion.sql` - Phase 4B execution gate,
+   fixture allowlist, durable `check_jobs` queue, service heartbeats, split
+   `onedash_scheduler`/`onedash_queue`/`onedash_ingestor` roles, restricted
+   scheduler/queue/ingestor functions, and removal of the legacy
+   `onedash_worker` grants and policies.
 
 ## Entity relationship diagram
 
@@ -116,6 +126,8 @@ erDiagram
   MONITORS ||--o{ MONITOR_SCHEDULES : "scheduled in regions"
   MONITORS ||--|| MONITOR_STATE : "current state"
   MONITORS ||--o{ CHECK_RESULTS : "history"
+  MONITORS ||--o{ CHECK_JOBS : "scheduled work"
+  MONITORS ||--o{ MONITOR_EXECUTION_ALLOWLIST : "fixture allowlist"
   MONITORS ||--o{ INCIDENTS : "opens"
   MONITORS ||--|| MONITOR_REQUEST_SECRETS : "encrypted request"
   MONITORS ||--o{ MONITOR_ALERT_CHANNELS : "routes"
@@ -139,6 +151,13 @@ not part of the tenant ERD. It stores the development limit and has no
 anon/authenticated grants or policies; app roles read it only through
 `monitor_limit_per_org()`. See [Monitor configuration and development
 limit](#monitor-configuration-and-development-limit).
+
+`monitor_execution_settings`, `monitor_execution_allowlist`, `check_jobs`, and
+`service_heartbeats` are operator/data-plane tables. They have RLS enabled with
+no policies and no direct grants to app or data-plane group roles. The
+scheduler, queue, and ingestor touch them only through restricted functions.
+`check_jobs` and `monitor_execution_allowlist` reference monitors; the execution
+gate and heartbeat tables are deliberately independent of tenant identity.
 
 ## Tenant model
 
@@ -164,7 +183,7 @@ are protected by triggers that reject changes.
 `authenticated` means a logged-in Supabase user. RLS is the authorization
 boundary; table grants are intentionally narrower than the policies.
 
-| Capability | owner | admin | member | viewer | worker |
+| Capability | owner | admin | member | viewer | anon |
 | --- | --- | --- | --- | --- | --- |
 | Read organization and co-members | yes | yes | yes | yes | no |
 | Read own profile | yes | yes | yes | yes | no |
@@ -172,29 +191,48 @@ boundary; table grants are intentionally narrower than the policies.
 | Delete organization | yes | no | no | no | no |
 | Add/remove members (non-owner) | yes | yes | no | no | no |
 | Grant/remove owner | yes | no | no | no | no |
-| Read monitors, schedules, state, results, incidents, updates | yes | yes | yes | yes | yes |
+| Read monitors, schedules, state, results, incidents, updates | yes | yes | yes | yes | no |
 | Create/update/delete monitors and schedules | yes | yes | yes | no | no |
-| Create/delete incidents | yes | yes | no | no | yes |
-| Update incidents | yes | yes | yes | no | yes |
-| Add incident updates as self | yes | yes | yes | no | yes |
-| Read alert-channel metadata | yes | yes | yes | yes | yes |
+| Create/delete incidents | yes | yes | no | no | no |
+| Update incidents | yes | yes | yes | no | no |
+| Add incident updates as self | yes | yes | yes | no | no |
+| Read alert-channel metadata | yes | yes | yes | yes | no |
 | Create/update/delete alert channels and links | yes | yes | no | no | no |
-| Read alert deliveries | yes | yes | no | no | yes |
-| Read/write alert deliveries | no | no | no | no | yes |
+| Read alert deliveries | yes | yes | no | no | no |
+| Read/write alert deliveries | no | no | no | no | no |
 | Read status pages and selected monitors | yes | yes | yes | yes | no |
 | Create/update/delete status pages and selections | yes | yes | no | no | no |
 | Read audit logs | yes | yes | no | no | no |
-| Read encrypted request/alert secrets | no | no | no | no | yes |
+| Read encrypted request/alert secrets | no | no | no | no | no |
 | Insert waitlist rows | service role only | service role only | service role only | service role only | no |
-| Read public published status pages | anon + authenticated | anon + authenticated | anon + authenticated | anon + authenticated | no |
+| Read public published status pages | anon + authenticated | anon + authenticated | anon + authenticated | anon + authenticated | yes |
 | Read effective monitor limit (`monitor_limit_per_org`) | yes | yes | yes | yes | no |
 | Change monitor limit settings | operator SQL only | operator SQL only | operator SQL only | operator SQL only | operator SQL only |
 
-The worker role is a global scheduler role. It can read monitoring and
-alerting rows for all tenants, but it has no access to profiles,
-organizations, memberships, audit logs, status pages, or waitlist rows. See
-[Worker role](#worker-role) for the exact grants and the known deviation from
-the roadmap wording.
+Phase 4B removes the broad `onedash_worker` role from the data plane. The role
+is retained as a deprecated NOLOGIN role, but every table, sequence, function,
+schema, and policy grant is revoked. Data-plane access is split by function:
+
+| Capability | onedash_scheduler | onedash_queue | onedash_ingestor | checker module |
+| --- | --- | --- | --- | --- |
+| Schedule due jobs | yes | no | no | no |
+| Claim, extend, release, or fail jobs | no | yes | no | no |
+| Acknowledge a job | no | yes | yes | no |
+| Ingest a validated result and complete its job atomically | no | no | yes | no |
+| Reap expired leases | yes | yes | no | no |
+| Record scheduler/worker heartbeat | yes | yes | no | no |
+| Read aggregate queue metrics | yes | yes | yes | no |
+| Read/write application tables directly | no | no | no | no |
+| Hold a database credential | yes | yes | yes | no |
+| Receive customer URLs or request secrets | no | no | no | minimal in-memory config only |
+
+All four capabilities are exercised through restricted `SECURITY DEFINER`
+functions with `search_path = ''`. `PUBLIC` has no execute privilege on those
+functions, and the three group roles have no direct table privileges. The
+checker module receives only the claimed job's minimal configuration (URL,
+method, expected statuses, timeout, TLS/redirect flags, and a
+`has_request_secrets` marker); it has no database client and no service-role
+key.
 
 ## RLS helpers
 
@@ -356,9 +394,10 @@ Phase 4A.1 adds two result counters through
 | `redirect_count` | `integer not null default 0`, `>= 0` | Number of redirect hops the checker followed. |
 | `response_bytes` | `integer`, `null` or `>= 0` | Body bytes read and discarded; `null` when no body was read. |
 
-The checker already returns both values in its sanitized result. Persisting them
-does not add ingestion: the Phase 4B result writer still has to store them. The
-migration is additive and does not modify the published Phase 4A migration.
+The checker already returns both values in its sanitized result. Phase 4B
+persists them through `onedash_ingest_check_result`, which derives tenant and
+monitor identity from the job row and stores the counters. The migration is
+additive and does not modify the published Phase 4A migration.
 `007_check_result_metrics.sql` covers stored values, defaults, negative-value
 rejection, and cross-tenant read isolation.
 
@@ -432,51 +471,157 @@ This is a development guard, not a plan or billing entitlement. There is no
 Stripe integration. A value above 200 means the dashboard list is truncated
 until pagination is added.
 
-## Worker role
+## Phase 4B data plane and roles
 
-`onedash_worker` is a `NOLOGIN` group role. Production should create a separate
-login role, grant it `onedash_worker`, and use that connection for the
-scheduler/checker. Do not use the service-role key as the worker's database
-identity.
+Phase 4B adds the scheduler, durable queue, worker service, and restricted
+ingestion, but **does not activate customer monitoring**. The execution gate is
+disabled by default. The worker and scheduler are separate Node processes from
+Next.js, and the checker remains a standalone module with no database client.
 
-Worker grants:
+### Queue choice
 
-- SELECT: `monitors`, `monitor_schedules`, `monitor_state`, `check_results`,
-  `incidents`, `incident_updates`, `alert_channels`, `alert_channel_secrets`,
-  `monitor_alert_channels`, `alert_deliveries`, `monitor_request_secrets`.
-- INSERT: `check_results`, `incidents`, `incident_updates`, `monitor_state`,
-  `alert_deliveries`.
-- UPDATE: `monitor_schedules`, `monitor_state`, `incidents`, `alert_deliveries`.
-- No access to `profiles`, `organizations`, `organization_members`,
-  `audit_logs`, `status_pages`, `status_page_monitors`, or `waitlist`.
+The queue is a PostgreSQL job table (`public.check_jobs`) with transactional
+claiming. Supabase Queues (PGMQ) 1.5.1 was available in the local Postgres 17
+image but was not installed. PGMQ provides durable messages and a visibility
+timeout, but it does not provide the Phase 4B requirements for idempotency-key
+deduplication, maximum attempts, exponential backoff, terminal dead-letter
+state, and simple restricted-role auditing in one place. A dedicated table with
+unique constraints and restricted functions is simpler to operate and test.
 
-The worker RLS policies use `using (true)` / `with check (true)` because a
-global scheduler must process every tenant. This is intentional, but it means
-the roadmap sentence "worker ... cannot ... read unrelated tenants" is not met
-as written. The worker can read monitoring and alerting rows across tenants; it
-cannot manage users or read unrelated tenant identity, audit, or status-page
-data. Treat the worker connection as a high-privilege data-plane credential.
+`check_jobs` has:
 
-### Phase 4A/4B checker permissions
+- A unique `idempotency_key` and a unique
+  `(monitor_id, region, scheduled_for)` slot. A duplicate scheduler tick cannot
+  create a second logical job.
+- `scheduled_for` (the logical UTC slot) and `available_at`
+  (`scheduled_for` plus deterministic jitter). Workers cannot claim before
+  `available_at`.
+- A per-claim `lease_token`, `lease_owner`, `lease_expires_at`, `attempts`, and
+  `max_attempts`. Claiming increments attempts. Extend, release, fail, and
+  ingest all require the matching unexpired lease token.
+- Statuses `pending`, `leased`, `completed`, and `dead_letter`, with constraints
+  preventing lease fields on non-leased rows and terminal timestamps on the
+  wrong states.
+- Exponential backoff in `onedash_fail_job`, capped at 300 seconds, and a
+  terminal `dead_letter` row when the attempt budget is exhausted.
+- A reaper (`onedash_reap_expired_leases`) that returns expired jobs to
+  `pending` or dead-letters them when the attempt budget is exhausted. It
+  increments `lease_expired_count` and records `lease_expired` as the sanitized
+  error class.
 
-The Phase 4A checker does not connect to the database, so it uses none of these
-grants today. The current `onedash_worker` role is broader than the checker
-needs and includes `monitor_request_secrets`, alert-channel secrets, and
-incident/state mutation. Before Phase 4B:
+### Execution gate and fixture allowlist
 
-- create a checker-specific group/login role rather than granting the checker
-  the global `onedash_worker` role;
-- grant only the monitor/schedule/lease fields needed for execution and
-  `INSERT` on `check_results` with idempotency;
-- keep scheduler/ingestor permissions separate from checker permissions where
-  possible;
-- do not grant request/alert secrets to the checker unless a later phase
-  explicitly implements authenticated request headers/bodies;
-- use a dedicated database credential, never the service-role key, and never
-  expose any service-role key to the browser or a `NEXT_PUBLIC_*` variable.
+`public.monitor_execution_settings` is a singleton operator table:
 
-This is a Phase 4B implementation requirement, not a change made by the Phase
-4A checker migration.
+- Default: `mode = 'disabled'`, `execution_enabled = false`.
+- The check constraint keeps `execution_enabled = (mode <> 'disabled')`.
+- `customer` mode additionally requires `egress_verified_at` and
+  `egress_verified_by`, but Phase 4B still refuses to schedule or claim
+  customer work.
+- There are no anon/authenticated or data-plane grants and no RLS policies.
+  Only an operator with direct database access can change it.
+
+`public.monitor_execution_allowlist` is an operator-managed list of monitor IDs
+that may be scheduled in fixtures mode. It is not a customer activation
+mechanism. The scheduler joins through it, and the claim function requires both
+that row and the worker's `ONEDASH_FIXTURE_HOSTS` host allowlist. A fixture
+worker therefore cannot claim a non-fixture host even if the database gate is
+misconfigured.
+
+### Scheduler
+
+`worker/scheduler/` runs a long-lived loop. Each tick:
+
+1. Reads the execution gate and logs mode changes.
+2. Reaps a bounded batch of expired leases.
+3. Calls `onedash_schedule_due_jobs(batch_size, jitter_seconds)`.
+4. Records a sanitized scheduler heartbeat.
+
+The scheduling function locks due schedule rows with
+`FOR UPDATE OF s SKIP LOCKED`, so multiple scheduler instances are safe. It
+only considers active monitors with a non-null `next_run_at <= now()` and a
+fixture allowlist row. It creates at most one job per logical slot and advances
+`monitor_schedules.next_run_at` in the same transaction. If the scheduler was
+down across multiple intervals, it creates one catch-up job and moves the next
+run to `now() + interval` instead of creating a backlog. All timestamps are
+`timestamptz`; the idempotency key uses the UTC slot. Jitter is deterministic
+per slot, not random per tick, so retries and multiple schedulers agree.
+
+### Worker and queue behavior
+
+`worker/service/` is a separate Node service with bounded concurrency. In
+`disabled` mode it heartbeats but never claims. In `fixtures` mode it:
+
+- Requires `ONEDASH_FIXTURE_HOSTS` and an allowlisted monitor.
+- Claims up to the free concurrency slots with `FOR UPDATE SKIP LOCKED`.
+- Extends leases while a check is in flight and aborts the check if the lease
+  is lost.
+- Uses the Phase 4A checker unchanged through `worker/checker/adapter.ts`.
+- Ingests checker output only. Fixture mode uses a deterministic, network-free
+  fixture checker for `.test` hosts, so stored results are synthetic test data,
+  not customer uptime. It never makes arbitrary external customer requests.
+- Releases work on graceful shutdown, fails with exponential backoff, and
+  dead-letters after `max_attempts`.
+- Records worker heartbeats and exposes health/metrics. Customer URLs,
+  hostnames, headers, bodies, secrets, and organization IDs are not logged.
+
+The service listens on `/healthz`, `/readyz`, and `/metrics` (default
+`127.0.0.1:9464`). `/readyz` checks both the queue and ingestor connections.
+`/metrics` includes runtime counters and aggregate queue metrics. A bearer
+token is required when the health host is not loopback.
+
+### Ingestion
+
+`worker/ingestor/` calls `onedash_ingest_check_result(job_id, lease_token,
+payload)`. The function:
+
+- Validates a strict payload vocabulary and rejects unknown fields.
+- Locks the job row and derives organization, monitor, region, scheduled slot,
+  and idempotency key from the job, not the payload. A caller cannot redirect a
+  result to another monitor or tenant.
+- Inserts into `check_results` with `ON CONFLICT (monitor_id,
+  idempotency_key) DO NOTHING`, so a retry after a committed transaction returns
+  the existing result instead of duplicating it.
+- Updates `monitor_state` atomically only when the new result is at least as new
+  as the stored `last_checked_at`.
+- Completes the matching job in the same transaction. A lost lease rolls back
+  the ingestion.
+- Creates no incidents, incident updates, alert deliveries, or notifications.
+  Phase 5 owns that state machine.
+
+### Permissions and credentials
+
+The migration creates three NOLOGIN group roles:
+`onedash_scheduler`, `onedash_queue`, and `onedash_ingestor`. Deployment must
+create separate LOGIN roles and grant exactly one group role to each process.
+The scheduler, queue, and ingestor group roles have **no direct table
+privileges**; they only execute the restricted functions listed in the role
+matrix. The legacy `onedash_worker` role has no direct table, sequence, function,
+schema, or policy grants. `PUBLIC` retains `USAGE` on schema `public`, so the
+role can see schema object names, but it has no data access.
+
+The checker module has no database client, no service-role key, and no direct
+private-data access. The worker process holds the restricted queue and ingestor
+connections and passes the checker only the claimed job's minimal configuration
+in memory. Do not grant the checker `monitor_request_secrets`,
+`alert_channel_secrets`, or incident/state mutation.
+
+### Activation prerequisites
+
+Phase 4B must not be used to monitor customer URLs. Before customer activation
+in a later phase:
+
+1. Implement and review the production egress-isolated worker host. The
+   application checker's DNS/IP policy is not a substitute for network policy.
+2. Verify egress denial for private, loopback, link-local, metadata,
+   control-plane, and Supabase private networks; record the verification in
+   `monitor_execution_settings.egress_verified_at/by`.
+3. Add the customer scheduling/claim path, which Phase 4B deliberately does not
+   implement, and remove the fixture-only host filters.
+4. Add multi-region routing, confirmation/quorum policy, load tests, and an
+   operational runbook.
+5. Obtain explicit approval before changing the execution gate. Do not set
+   `customer` mode in this phase.
 
 ## Check-result retention and partitioning plan
 
@@ -514,7 +659,7 @@ The pgTAP suite is in `supabase/tests/database/`:
   hardening, default privilege removal, and waitlist privileges.
 - `002_tenant_isolation.sql` — anon denial, same-org access, other-org denial,
   owner/admin/member/viewer permissions, last-owner invariant, bootstrap
-  idempotency, and worker grants.
+  idempotency, and legacy-worker denial.
 - `003_constraints_and_waitlist.sql` — monitor/schedule/result/incident
   constraints, idempotency, waitlist validation, and service-role write path.
 - `004_public_status_pages.sql` — published-only public views, active/selected
@@ -528,8 +673,25 @@ The pgTAP suite is in `supabase/tests/database/`:
 - `007_check_result_metrics.sql` — Phase 4A.1 `redirect_count` and
   `response_bytes` storage, defaults, non-negative constraints, and tenant
   isolation.
+- `008_phase4b_queue_permissions.sql` - Phase 4B role separation, split function
+  grants, legacy-worker denial, execution-gate defaults, queue constraints, RLS
+  with no policies, and restricted-role execution smoke checks.
 
-The suite currently has **211 assertions across seven files**.
+The suite currently has **276 assertions across eight files**.
+
+Phase 4B also has a separate multi-connection integration test:
+`tests/phase4b/database-pipeline.test.ts`. It is not part of the default
+`npm test` suite because it needs a running local database. It creates four
+independent connections using disposable `onedash_test_*` login roles, then
+verifies scheduler idempotency and concurrent-scheduler safety, claim/lease
+ownership, retries and dead-lettering, expired-lease recovery, restricted
+ingestion and monitor-state updates, the execution gate, fixture host
+allowlisting, metrics, and permission denial. It uses a dedicated monitor and
+cleans up its roles and rows. Run it with:
+
+```bash
+npm run test:phase4b
+```
 
 Run:
 
@@ -545,43 +707,54 @@ test-specific slugs and IDs so seed data does not make counts ambiguous.
 
 ## Known gaps and deviations
 
-1. **Worker cross-tenant access.** Intentional for a global scheduler, but it
-   does not satisfy the roadmap's literal "cannot read unrelated tenants"
-   wording. The worker is limited to monitoring/alerting tables.
-2. **No partitioning or rollups.** Retention and partitioning are documented
-   but not implemented. `check_results` is a normal table.
-3. **No shared waitlist limiter.** The direct anon INSERT bypass is closed, but
-   the remaining rate limit is in-process and per instance.
-4. **Auth E2E is manual only.** The signup → email confirmation → callback →
-   dashboard → refresh → logout → login flow passed in a browser against this
-   local stack on 2026-10-28. No Playwright suite runs in CI, so the README
-   checklist remains required after auth changes.
-5. **No hosted deployment.** Migrations have not been pushed to a remote
-   Supabase project. Do not run `supabase db push` against production without
-   review and a backup.
-6. **No scheduler, worker service, or result ingestion.** Phase 3 defines and
-   manages the configuration contract; Phase 4A.1 adds a standalone checker
-   module and result-metric columns. There is no test-check action, scheduler,
-   outbound request from the app, result writer, or alert delivery. Do not
-   describe checks as running.
-7. **Egress isolation is not implemented by this repository.** The checker
+1. **Customer execution is not implemented.** The execution gate is disabled,
+   the scheduler only queues operator-allowlisted fixtures, and the worker
+   refuses `customer` mode. There is no outbound customer request, test-check
+   action, alert sender, or customer-facing uptime data. Do not describe
+   customer checks as running.
+2. **Ingestion does not create incidents or notifications.** It stores the
+   submitted checker result, updates `monitor_state`, and completes the job.
+   Fixture-mode results are synthetic `.test` data, not customer uptime.
+   Confirmation policy, incidents, and alert delivery remain Phase 5 work.
+3. **Egress isolation is not implemented by this repository.** The checker
    rejects non-public addresses and pins validated DNS answers, but application
    validation alone is not sufficient. The worker host/network must deny
    egress to private, link-local, loopback, metadata, control-plane, and
    Supabase private networks. If the hosting environment cannot enforce that,
    customer checks are a release blocker. See `worker/README.md`.
-8. **The worker role is broader than the checker needs.** `onedash_worker` is a
-   global scheduler role with cross-tenant monitoring/alerting access and
-   secret reads. Phase 4B must split checker/scheduler/ingestor permissions.
-   The Phase 4A checker does not use the database.
-9. **The monitor limit is a development guard.** It is not a plan or billing
-   entitlement. The default is 25 per organization and is operator-editable.
-10. **The monitor list is capped at 200 rows.** There is no pagination; the
+4. **No multi-region routing or load test.** Phase 4B runs one fixture region
+   (`local-1` by default). Region routing, confirmation/quorum, capacity, and
+   load targets remain unverified.
+5. **No partitioning or rollups.** Retention and partitioning are documented
+   but not implemented. `check_results` is a normal table.
+6. **No shared waitlist limiter.** The direct anon INSERT bypass is closed, but
+   the remaining rate limit is in-process and per instance.
+7. **Auth E2E is manual only.** The signup, email confirmation, callback,
+   dashboard, refresh, logout, and login flow passed in a browser against this
+   local stack on 2026-10-28. No Playwright suite runs in CI, so the README
+   checklist remains required after auth changes.
+8. **No hosted deployment.** Migrations have not been pushed to a remote
+   Supabase project. Do not run `supabase db push` against production without
+   review and a backup.
+9. **Phase 4B integration coverage is local-only.** The pipeline test uses four
+   restricted-role connections, requires a running local Supabase database, and
+   creates disposable login roles. It includes a worker-runtime end-to-end pass
+   through the restricted queue and ingestor clients. It is not a hosted,
+   multi-region, or failure-injection test.
+10. **The monitor limit is a development guard.** It is not a plan or billing
+    entitlement. The default is 25 per organization and is operator-editable.
+11. **The monitor list is capped at 200 rows.** There is no pagination; the
     dashboard shows a truncation notice when the organization count is larger.
-11. **Service-role scope is minimal.** It can INSERT waitlist rows and has the
+12. **Service-role scope is minimal.** It can INSERT waitlist rows and has the
     default non-DML grants, but it cannot SELECT waitlist rows. Future server
     features need explicit, reviewed grants.
-12. **The Phase 4A preflight is local-only so far.** It was run against the
+13. **The Phase 4A preflight is local-only so far.** It was run against the
     seeded local database (3 monitors, 0 blocking, 0 unexpected error classes).
     It has not been run against a remote or production database, and no remote
     database has been linked, modified, or reset.
+14. **The legacy worker role is retained.** `onedash_worker` is a deprecated
+    NOLOGIN role with no direct table, sequence, function, schema, or policy
+    grants. `PUBLIC` still exposes schema `USAGE`, but the role has no data
+    access.
+    It exists only so old deployment configuration fails closed while it is
+    migrated to the split roles.

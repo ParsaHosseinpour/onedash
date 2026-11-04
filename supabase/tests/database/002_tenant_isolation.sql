@@ -1,4 +1,4 @@
--- Tenant isolation, role permissions, account bootstrap, and worker grants.
+-- Tenant isolation, role permissions, account bootstrap, and legacy-worker denial.
 begin;
 
 create extension if not exists pgtap with schema extensions;
@@ -862,76 +862,104 @@ select throws_ok(
 );
 
 -- ============================================================
--- Worker role
+-- Legacy worker role (Phase 4B: no data access)
 -- ============================================================
 set local role onedash_worker;
 
-select lives_ok(
+select throws_ok(
   'select * from public.monitors',
-  'worker can read monitor configuration'
+  '42501',
+  null,
+  'legacy worker cannot read monitors'
+);
+
+select throws_ok(
+  'select * from public.monitor_request_secrets',
+  '42501',
+  null,
+  'legacy worker cannot read request secrets'
+);
+
+select throws_ok(
+  'select * from public.check_results',
+  '42501',
+  null,
+  'legacy worker cannot read check results'
+);
+
+select throws_ok(
+  'select * from public.check_jobs',
+  '42501',
+  null,
+  'legacy worker cannot read scheduler jobs'
+);
+
+select throws_ok(
+  'select * from public.monitor_state',
+  '42501',
+  null,
+  'legacy worker cannot read monitor state'
+);
+
+select throws_ok(
+  'select * from public.alert_channel_secrets',
+  '42501',
+  null,
+  'legacy worker cannot read alert credentials'
 );
 
 select throws_ok(
   'select * from public.profiles',
   '42501',
   null,
-  'worker cannot read user profiles'
+  'legacy worker cannot read user profiles'
 );
 
 select throws_ok(
   'select * from public.organizations',
   '42501',
   null,
-  'worker cannot read organizations'
+  'legacy worker cannot read organizations'
 );
 
 select throws_ok(
   'select * from public.audit_logs',
   '42501',
   null,
-  'worker cannot read audit logs'
-);
-
-select lives_ok(
-  $$ insert into public.check_results (
-       organization_id, monitor_id, region, status, idempotency_key
-     ) values (
-       (
-         select organization_id from public.monitors
-         where id = '2aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-       ),
-       '2aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-       'us-east', 'up', 'worker-result-1'
-     ) $$,
-  'worker can ingest a check result'
+  'legacy worker cannot read audit logs'
 );
 
 select throws_ok(
   $$ insert into public.check_results (
        organization_id, monitor_id, region, status, idempotency_key
      ) values (
-       (
-         select organization_id from public.monitors
-         where id = '2aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-       ),
+       '00000000-0000-4000-8000-000000000000',
        '2aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-       'us-east', 'up', 'worker-result-1'
+       'us-east', 'up', 'legacy-worker-result'
      ) $$,
-  '23505',
+  '42501',
   null,
-  'worker retries are idempotent'
+  'legacy worker cannot insert check results directly'
 );
 
-select lives_ok(
-  $$ update public.monitor_state
-     set consecutive_successes = consecutive_successes + 1
-     where monitor_id = '2aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' $$,
-  'worker can update monitor state'
+select throws_ok(
+  $$ select public.onedash_claim_jobs(
+       'legacy-worker', 'us-east', 60, 1, array['api.acme.test']
+     ) $$,
+  '42501',
+  null,
+  'legacy worker cannot claim scheduler jobs'
 );
 
-select lives_ok(
-  'select * from public.alert_channel_secrets',
-  'worker can read the encrypted alert credentials it needs to deliver alerts'
+select throws_ok(
+  $$ select public.onedash_ingest_check_result(
+       '00000000-0000-4000-8000-000000000001'::uuid,
+       '00000000-0000-4000-8000-000000000002'::uuid,
+       '{}'::jsonb
+     ) $$,
+  '42501',
+  null,
+  'legacy worker cannot ingest results through the restricted function'
 );
 
 select * from finish();

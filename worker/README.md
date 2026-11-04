@@ -1,10 +1,12 @@
-# OneDash checker foundation (Phase 4A/4A.1)
+# OneDash worker, scheduler, and checker (Phase 4B)
 
-This directory contains the Phase 4A.1 HTTP/HTTPS checker. It is a standalone
-TypeScript module with no Next.js imports, no database client, and no scheduler.
-It is not wired to the application and it does **not** enable customer checks.
-The worker service, result ingestion, scheduling, and multi-region execution are
-Phase 4B/4C work.
+This directory contains the Phase 4B scheduler, queue client, worker service,
+ingestor client, and the Phase 4A.1 HTTP/HTTPS checker. The worker and scheduler
+are standalone Node processes with no Next.js imports. The checker itself has no
+database client and no scheduler. Phase 4B stores checker output for
+operator-allowlisted fixtures only; fixture output is synthetic `.test` data,
+not customer uptime, and customer execution is locked and refused.
+Multi-region execution and customer activation remain later work.
 
 The checker is intentionally independently testable: DNS resolution, the HTTP
 transport, and the server limits can be injected in tests. There is no
@@ -24,6 +26,18 @@ seams are rejected unless `NODE_ENV=test`.
 | `checker/limits.ts` | Server-enforced ceilings and test-only lowering of limits. |
 | `checker/runner.ts` | Bounded-concurrency runner with cancellation and first-error propagation. |
 | `checker/errors.ts` | Sanitized error vocabulary and fixed user-facing messages. |
+| `config.ts` | Environment validation, fixture-mode lock, customer-mode rejection, and bounded worker/scheduler settings. |
+| `logging.ts` | JSON logger, error classification, and reason sanitization. |
+| `queue/queue-client.ts` | Restricted queue RPC client for claim/lease/retry/reap/heartbeat/metrics. |
+| `ingestor/ingestor-client.ts` | Restricted ingestion RPC client. |
+| `ingestor/result-payload.ts` | Strict checker-result-to-ingest-payload mapping. |
+| `checker/adapter.ts` | Phase 4A checker reuse, local fixture checker, and locked customer checker. |
+| `service/worker-runtime.ts` | Bounded concurrency, lease extension, retries, shutdown, and runtime metrics. |
+| `service/health-server.ts` | `/healthz`, `/readyz`, and `/metrics` HTTP endpoints. |
+| `service/main.ts` | Worker process entry point and graceful signal handling. |
+| `scheduler/scheduler-client.ts` | Restricted scheduler RPC client. |
+| `scheduler/scheduler-runtime.ts` | Scheduler loop, lease reaping, heartbeat, and metrics. |
+| `scheduler/main.ts` | Scheduler process entry point and graceful signal handling. |
 
 Tests live in `tests/checker/` and run with:
 
@@ -38,6 +52,160 @@ no private key or certificate is committed. If the local OpenSSL CLI or the
 Node test-CA API is unavailable, the TLS tests are explicitly skipped
 ("blocked"), not reported as passed. The IPv6 loopback test is also skipped when
 the environment cannot bind `::1`.
+
+Worker and scheduler unit tests:
+
+```bash
+npm run test:worker
+npm run test:scheduler
+```
+
+The database pipeline test (four restricted-role connections) requires a
+running local Supabase database and uses disposable restricted-role login roles:
+
+```bash
+npm run test:phase4b
+```
+
+## Phase 4B runtime
+
+The scheduler and worker are separate long-running Node processes. The worker
+uses two restricted PostgreSQL connections: one for the queue role and one for
+the ingestor role. The scheduler uses a third restricted connection. The checker
+receives no database client and no service-role key.
+
+### Modes
+
+| Mode | Behavior |
+| --- | --- |
+| `disabled` (default) | Heartbeats only. Never claims a job. The scheduler sees the disabled gate and schedules nothing. |
+| `fixtures` | Requires `ONEDASH_FIXTURE_HOSTS` and an operator allowlist row. Claims only allowlisted fixture monitors whose host is in that list. Uses the local fixture checker for `.test` hosts. |
+| `customer` | **NOT IMPLEMENTED.** Configuration loading rejects the process before it starts. |
+
+The execution gate in `public.monitor_execution_settings` must also be enabled
+with `mode = 'fixtures'` before the scheduler creates jobs or the queue returns
+one. Both checks are deliberate; either one can stop execution.
+
+### Commands
+
+```bash
+npm run worker:build          # compile to dist-worker/
+npm run worker:service        # run the worker with tsx
+npm run worker:scheduler      # run the scheduler with tsx
+npm run worker:start:service  # run the compiled worker
+npm run worker:start:scheduler
+```
+
+`tsx` and Node read environment variables from the process environment; they do
+not automatically load `.env.local`. Export the variables in the shell or use a
+process manager. Never commit connection strings or metrics tokens.
+
+### Environment
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `ONEDASH_WORKER_EXECUTION_MODE` | `disabled` | `disabled` or `fixtures`; `customer` is rejected. |
+| `ONEDASH_QUEUE_DATABASE_URL` | required | Login role granted `onedash_queue`. |
+| `ONEDASH_INGESTOR_DATABASE_URL` | required | Login role granted `onedash_ingestor`. |
+| `ONEDASH_SCHEDULER_DATABASE_URL` | required for scheduler | Login role granted `onedash_scheduler`. |
+| `ONEDASH_DB_SSL` | `false` | Set `true` for a hosted database that requires TLS. |
+| `ONEDASH_REGION` | `local-1` | Worker region; must match a scheduled job region. |
+| `ONEDASH_SCHEDULER_REGION` | `global` | Scheduler heartbeat/region label. |
+| `ONEDASH_WORKER_ID` | `worker-<pid>` | Unique worker instance id. |
+| `ONEDASH_SCHEDULER_ID` | `scheduler-<pid>` | Unique scheduler instance id. |
+| `ONEDASH_WORKER_CONCURRENCY` | `2` | 1-10 in-flight checks. |
+| `ONEDASH_LEASE_SECONDS` | `120` | 30-600 seconds. |
+| `ONEDASH_POLL_INTERVAL_MS` | `1000` | 250-60,000 ms. |
+| `ONEDASH_HEARTBEAT_INTERVAL_MS` | `5000` | 1,000-60,000 ms. |
+| `ONEDASH_REAP_INTERVAL_MS` | `5000` | 1,000-60,000 ms. |
+| `ONEDASH_SHUTDOWN_GRACE_MS` | `15000` | 1,000-60,000 ms. |
+| `ONEDASH_FIXTURE_HOSTS` | empty | Comma-separated `.test` hosts; required in fixtures mode. |
+| `ONEDASH_HEALTH_HOST` | `127.0.0.1` | Non-loopback requires a metrics token. |
+| `ONEDASH_HEALTH_PORT` | `9464` | 1-65,535. |
+| `ONEDASH_METRICS_TOKEN` | none | At least 16 characters; bearer token for `/readyz` and `/metrics`. |
+| `ONEDASH_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error`. |
+| `ONEDASH_SCHEDULER_INTERVAL_MS` | `5000` | 1,000-60,000 ms. |
+| `ONEDASH_SCHEDULER_BATCH_SIZE` | `50` | 1-100 schedules per tick. |
+| `ONEDASH_SCHEDULER_JITTER_SECONDS` | `10` | 0-30 seconds of deterministic per-slot jitter. |
+
+### Health and metrics
+
+The worker serves:
+
+- `GET /healthz` - process liveness, always `200` while the HTTP server is up.
+- `GET /readyz` - pings both restricted database connections and reports the
+  worker's execution mode, in-flight count, and readiness. Returns `503` when a
+  connection or the runtime is not ready.
+- `GET /metrics` - runtime counters plus aggregate queue metrics. The aggregate
+  query returns counts, ages, and durations; it never returns customer URLs,
+  hostnames, monitor IDs, organization IDs, or secrets.
+
+`/readyz` and `/metrics` require `Authorization: Bearer <ONEDASH_METRICS_TOKEN>`
+when a token is configured. The token is required when the health host is not
+loopback. Keep the health server on a private network.
+
+Runtime metrics include claimed/completed/failed/retried/released/reaped jobs,
+timeouts, check-duration count/sum/max, in-flight/concurrency, last claim and
+heartbeat times, and the last sanitized error class. Scheduler metrics include
+ticks, scheduled/skipped totals, reaped/dead-lettered totals, and the last tick
+and heartbeat. Queue metrics include depth, oldest pending age, leased count,
+expired-lease count, and completed/failed/retried counters.
+
+### Queue and ingestion behavior
+
+- Jobs are claimed with `FOR UPDATE SKIP LOCKED`; each claim gets a random
+  `lease_token`. A stale worker cannot extend, fail, release, or ingest after
+  another worker reclaims the job.
+- The worker extends the lease while a check is in flight. If extension fails or
+  the lease is lost, it aborts the check instead of writing a result under a
+  stale lease.
+- Failures are retried with exponential backoff, capped at 300 seconds. The
+  default maximum is 5 attempts. Exhausted jobs become `dead_letter`.
+- The worker and scheduler reap expired leases. Expired jobs are retried or
+  dead-lettered based on their attempt budget.
+- Ingestion uses the job row's organization, monitor, region, scheduled slot,
+  and idempotency key. The payload cannot select a different monitor or tenant.
+  A duplicate ingestion returns the existing result and does not regress monitor
+  state.
+- Ingestion completes the job in the same transaction. It does not create
+  incidents, incident updates, alert deliveries, or notifications.
+- Graceful shutdown stops claiming, aborts in-flight checks, releases claimed
+  work where possible, waits for the configured grace period, and closes the
+  database pools.
+
+### Data-plane permissions
+
+The migration creates `onedash_scheduler`, `onedash_queue`, and
+`onedash_ingestor` as NOLOGIN group roles. Create one LOGIN role per process and
+grant exactly one group role:
+
+```sql
+create role onedash_worker_login login password '...';
+grant onedash_queue to onedash_worker_login;
+```
+
+Do not reuse the Supabase service-role key or the legacy `onedash_worker` role.
+The legacy role has no direct table, sequence, function, schema, or policy
+grants; `PUBLIC` still exposes schema `USAGE`, but it has no data access. The
+new group roles have no direct table access either; they only execute their
+restricted functions. The checker module has no database credential and no
+service-role key.
+
+### Activation prerequisites
+
+Do not enable customer monitoring with Phase 4B. The scheduler and claim
+function intentionally refuse `customer` mode even if the gate is changed. A
+later phase must:
+
+1. Implement the production egress-isolated worker host and verify network
+   denial for private, loopback, link-local, metadata, control-plane, and
+   Supabase private networks.
+2. Record that verification in
+   `monitor_execution_settings.egress_verified_at/by`.
+3. Add the customer scheduling/claim path, multi-region routing, and the
+   confirmation/quorum policy.
+4. Add load, failure-injection, and hosted operational tests.
+5. Obtain explicit approval before changing the gate.
 
 ## Supported contract
 
@@ -137,9 +305,9 @@ an environment variable. Test overrides may only lower the ceilings.
 timings, `errorClass`, a fixed `errorMessage`, redirect count, body-byte count,
 and `checkedAt`. The Phase 4A.1 migration
 `20261101090000_check_result_metrics.sql` adds matching `redirect_count` and
-`response_bytes` columns to `check_results`; ingestion is still Phase 4B work.
-Only counters are stored, never a body, header, URL, hostname, query string, or
-secret.
+`response_bytes` columns to `check_results`; Phase 4B persists them through the
+restricted ingestor. Only counters are stored, never a body, header, URL,
+hostname, query string, or secret.
 
 | Situation | `status` | `errorClass` |
 | --- | --- | --- |
@@ -169,27 +337,17 @@ cancellation. The total-deadline timer and caller abort listener are also
 removed in `finally`. A response body that exceeds the cap is destroyed before
 the error is returned.
 
-## Worker role and Phase 4B requirements
+## Checker isolation and remaining deployment gates
 
-The Phase 4A checker does not read or write the database. The existing
-`onedash_worker` group role is global and broader than the checker needs. Before
-Phase 4B:
+The checker module has no database client, no service-role key, and no direct
+access to tenant tables. The worker process holds only the restricted queue and
+ingestor connections and passes the checker the minimal claimed configuration
+in memory. The legacy `onedash_worker` role is deprecated and has no privileges.
 
-- Use a separate login role that is a member of a **checker-specific** group,
-  not the current broad `onedash_worker` role.
-- Grant the checker only the monitor fields it needs, the schedule/lease fields
-  it needs, and `INSERT` on `check_results` with idempotency. Do not grant
-  `monitor_request_secrets`, alert-channel secrets, incident management, or
-  cross-tenant identity data to the checker unless a later phase explicitly
-  requires them.
-- Keep the scheduler/ingestor and the checker as separate roles where possible.
-  A checker compromise must not become a control-plane or alerting compromise.
-- Use a dedicated database credential, not the Supabase service-role key, and
-  never put any service-role key in browser code or `NEXT_PUBLIC_*` variables.
-- Add heartbeat/lease permissions separately from result ingestion.
-
-The current broad role is documented in `docs/database.md`. It is a known
-Phase 2 deviation, not the final Phase 4B permission model.
+Phase 4B does not prove deployment isolation. Before customer checks can be
+enabled, the worker host/network must enforce egress isolation and the
+activation prerequisites in the Phase 4B runtime section must be met. The
+checker's DNS/IP policy is one layer, not a replacement for network policy.
 
 ## Deployment egress isolation (release blocker)
 
@@ -251,8 +409,11 @@ production migration, an operator must:
 
 ## Known limitations
 
-- No scheduler, queue, leases, worker service, database ingestion, idempotent
-  persistence, metrics, or multi-region execution. Phase 4 is not complete.
+- Scheduler, durable queue, leases, worker service, restricted ingestion,
+  idempotent persistence, and metrics exist for **fixtures only**. Customer
+  execution is disabled and `customer` mode is rejected.
+- No multi-region execution, confirmation/quorum policy, alert delivery,
+  incident automation, hosted deployment, or Docker packaging.
 - No body assertions, custom headers, request bodies, encrypted request
   secrets, certificate-expiry capture, or latency-threshold evaluation.
 - The production DNS resolver is the system resolver (`dns.lookup`). The

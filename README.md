@@ -3,15 +3,16 @@
 OneDash is an early-stage uptime-monitoring product. The current branch adds a
 versioned Supabase database foundation with tenant isolation, RLS, a hardened
 waitlist, account bootstrap, pgTAP tests, a tenant-safe monitor configuration
-UI, and a standalone Phase 4A.1 HTTP/HTTPS checker foundation. The checker now
+UI, a standalone Phase 4A.1 HTTP/HTTPS checker, and the Phase 4B scheduler,
+durable queue, worker service, and restricted result ingestor. The checker now
 rejects HTTPS-to-HTTP redirect downgrades, retries a bounded set of validated
 addresses before any response, and has local trusted-TLS coverage. The
 cookie-based auth flow has been verified manually in a browser; automated
-Playwright E2E is
-still missing. It is **not yet an uptime monitor**: the checker is not wired to
-a scheduler or database, there is no alert sender or deployed public status
-page, and saved monitor configurations are not being checked. See
-[`ROADMAP.md`](./ROADMAP.md), [`docs/database.md`](./docs/database.md), and
+Playwright E2E is still missing. It is **not yet an uptime monitor for
+customers**: Phase 4B runs only operator-allowlisted fixtures, the execution
+gate is disabled by default, and the worker refuses customer mode. There is no
+alert sender or deployed public status page. See [`ROADMAP.md`](./ROADMAP.md),
+[`docs/database.md`](./docs/database.md), and
 [`worker/README.md`](./worker/README.md).
 
 ## Stack
@@ -22,6 +23,8 @@ page, and saved monitor configurations are not being checked. See
 - Tailwind CSS 4
 - Supabase Auth, Postgres, RLS, and the Supabase CLI
 - `undici` for the pinned HTTP transport and `ipaddr.js` for IP policy
+- `pg` for restricted worker/scheduler/ingestor database connections
+- `tsx` for running the standalone worker and scheduler in development
 - Vitest + Testing Library
 - pgTAP database tests
 
@@ -96,6 +99,20 @@ page, and saved monitor configurations are not being checked. See
    Open <http://localhost:3000>. Confirmation emails from local signup appear in
    Mailpit at <http://localhost:54424>.
 
+6. Optional: build and run the Phase 4B worker or scheduler:
+
+   ```bash
+   npm run worker:build
+   ```
+
+   The worker defaults to `disabled` mode and only heartbeats. To run a local
+   fixture check, set `ONEDASH_WORKER_EXECUTION_MODE=fixtures`,
+   `ONEDASH_FIXTURE_HOSTS`, the three restricted database URLs, and enable the
+   database gate with `mode = 'fixtures'`. The scheduler only queues
+   operator-allowlisted fixtures. See [`worker/README.md`](./worker/README.md)
+   for the complete environment and safety rules. Never use the service-role
+   key for a worker connection.
+
 ### Seed accounts
 
 The seed creates two organizations and six confirmed local users. All use the
@@ -131,7 +148,7 @@ historical waitlist file; it is retained for reference and must not be applied
 after the migrations. The waitlist migration intentionally changes its grants
 to close the direct anon PostgREST INSERT bypass.
 
-The current suite has **211 pgTAP assertions** across seven files:
+The current suite has **276 pgTAP assertions** across eight files:
 
 - `001_schema_invariants.sql` — RLS coverage, indexes, constraints, function
   hardening, default privilege removal, and waitlist privileges.
@@ -150,6 +167,9 @@ The current suite has **211 pgTAP assertions** across seven files:
   sanitized `check_results.error_class` vocabulary.
 - `007_check_result_metrics.sql` — Phase 4A.1 `redirect_count` /
   `response_bytes` defaults, non-negative constraints, and tenant isolation.
+- `008_phase4b_queue_permissions.sql` - Phase 4B role separation, split function
+  grants, legacy-worker denial, execution-gate defaults, queue constraints, and
+  restricted-role smoke checks.
 
 The tests run against the seeded local database. They create their own users
 and organizations inside a transaction and roll back, and they scope assertions
@@ -167,9 +187,15 @@ helpers, worker role, retention/partition plan, and known deviations.
 | `npm start` | Serve the production build. |
 | `npm run lint` | Run ESLint. |
 | `npm run typecheck` | Run `tsc --noEmit`. |
-| `npm test` | Run Vitest once. |
+| `npm test` | Run the default Vitest suite (excludes the Phase 4B DB pipeline test). |
 | `npm run test:checker` | Run only the Phase 4A.1 checker tests. |
+| `npm run test:worker` | Run worker and scheduler unit tests. |
+| `npm run test:scheduler` | Run only scheduler unit tests. |
+| `npm run test:phase4b` | Run the Phase 4B database pipeline test with four restricted-role connections (local DB required). |
 | `npm run test:watch` | Run Vitest in watch mode. |
+| `npm run worker:build` | Compile the worker and scheduler to `dist-worker/`. |
+| `npm run worker:service` | Run the worker with `tsx`. |
+| `npm run worker:scheduler` | Run the scheduler with `tsx`. |
 
 ## Checker foundation (Phase 4A.1)
 
@@ -197,8 +223,9 @@ Phase 4A.1 adds:
   Undici + local TLS server path. A missing OpenSSL CLI, missing Node test-CA
   API, or an environment that cannot bind `::1` skips the affected tests
   explicitly rather than reporting a false pass.
-- The new `20261101090000_check_result_metrics.sql` migration persists
-  `redirect_count` and `response_bytes`. Ingestion itself is still Phase 4B work.
+- The `20261101090000_check_result_metrics.sql` migration adds
+  `redirect_count` and `response_bytes`; Phase 4B persists them through the
+  restricted ingestor.
 
 It is also tested with injected DNS/transport fakes and local loopback
 HTTP/HTTPS servers, including decimal/hex IP forms, IPv4-mapped IPv6, DNS
@@ -211,12 +238,74 @@ run the read-only
 check. It reports blocking monitor rows and rolls back; it does not delete,
 disable, or rewrite monitors. See [`worker/README.md`](./worker/README.md).
 
-This is a foundation, not a running monitoring service. There is no scheduler,
-worker service, result ingestion, or customer check. Before Phase 4B, the worker
-host must enforce egress isolation for private, link-local, loopback, metadata,
+The checker remains a foundation, not a customer monitoring service. Phase 4B
+adds a scheduler, worker service, and restricted ingestion for fixtures only;
+customer checks remain disabled. Before customer activation, the worker host
+must enforce egress isolation for private, link-local, loopback, metadata,
 control-plane, and Supabase private networks. Application validation alone is
 not sufficient; if the hosting environment cannot enforce it, enabling customer
 checks is a release blocker. See [`worker/README.md`](./worker/README.md).
+
+## Scheduler, worker, and ingestion (Phase 4B)
+
+Phase 4B adds the data-plane foundation without activating customer monitoring:
+
+- **Queue:** a durable PostgreSQL job table (`public.check_jobs`) with unique
+  idempotency keys, unique `(monitor, region, scheduled slot)` rows, safe
+  `FOR UPDATE SKIP LOCKED` claiming, lease tokens, exponential backoff, maximum
+  attempts, dead-letter state, and expired-lease recovery. Supabase Queues
+  (PGMQ) 1.5.1 was available locally but not installed; it lacks the required
+  built-in idempotency dedupe, retry/backoff policy, terminal states, and simple
+  restricted-role auditing, so a dedicated table was chosen.
+- **Scheduler:** a standalone Node loop in `worker/scheduler/` that processes
+  only active, due, operator-allowlisted fixture monitors, uses row locks and
+  deterministic per-slot jitter, advances `next_run_at` safely, skips missed
+  downtime slots instead of creating a backlog, and records heartbeats/metrics.
+- **Worker:** a separate Node service in `worker/service/` with bounded
+  concurrency, lease extension, graceful shutdown, `/healthz`, `/readyz`, and
+  `/metrics`. It reuses the Phase 4A checker through `worker/checker/adapter.ts`.
+  Customer mode is rejected; the default is `disabled`.
+- **Ingestion:** a restricted `SECURITY DEFINER` function derives tenant,
+  monitor, region, slot, and idempotency key from the job row, validates a
+  strict payload, stores the checker result, updates `monitor_state` only for
+  newer results, and completes the job in one transaction. It does not create
+  incidents or notifications. Fixture-mode output is synthetic test data for
+  operator-allowlisted `.test` monitors, not customer uptime.
+- **Permissions:** `onedash_scheduler`, `onedash_queue`, and `onedash_ingestor`
+  are NOLOGIN group roles with no direct table access. Each process gets a
+  separate login role and only the restricted functions it needs. The checker
+  module has no database client and no service-role key. The legacy
+  `onedash_worker` role has all grants and policies revoked.
+- **Execution gate:** `public.monitor_execution_settings` is disabled by
+  default. The scheduler and claim function refuse `customer` mode even if the
+  gate is changed. Fixture mode also requires an operator allowlist row and the
+  worker's `ONEDASH_FIXTURE_HOSTS` list.
+
+Run the local checks:
+
+```bash
+npm run test:worker
+npm run test:scheduler
+npm run test:phase4b
+npm run worker:build
+```
+
+The database pipeline test is intentionally separate from
+`npm test`; it requires a running local Supabase database. It uses disposable
+restricted login roles and a dedicated monitor, and it covers concurrent
+scheduler safety, idempotency, retries, dead-lettering, lease recovery, the
+execution gate, fixture allowlisting, ingestion, metrics, permission denial, and
+an end-to-end worker runtime pass through the restricted queue and ingestor
+clients.
+
+### Customer activation is blocked
+
+Do not enable customer monitoring with Phase 4B. Before a later phase can do
+that, the worker host/network must enforce egress isolation for private,
+loopback, link-local, metadata, control-plane, and Supabase private networks;
+the verification must be recorded in the execution gate; the customer
+scheduling/claim path, multi-region routing, confirmation/quorum policy, load
+tests, and runbook must exist. See [`worker/README.md`](./worker/README.md).
 
 ## Environment behavior
 
@@ -377,12 +466,21 @@ supabase/
   tests/database/            pgTAP RLS, constraint, and privilege tests
   preflight/                 read-only Phase 4A migration compatibility check
   schema.sql                 legacy Phase 1 waitlist file (do not re-apply)
-docs/database.md             ERD, role matrix, RLS and retention notes
+docs/database.md             ERD, role matrix, RLS, queue, and retention notes
 tests/                       Vitest unit/integration and component tests
 tests/checker/               Phase 4A.1 checker tests and runtime TLS fixtures
+tests/worker/                worker runtime, config, logging, payload, health tests
+tests/scheduler/             scheduler runtime tests
+tests/phase4b/               database pipeline test (four restricted roles)
 worker/
   checker/                   standalone HTTP/HTTPS checker (no Next.js imports)
-  README.md                  checker contract, limits, egress, Phase 4B notes
+  queue/                     restricted queue RPC client
+  ingestor/                  restricted ingestion client and payload mapping
+  service/                   worker runtime, health server, and entry point
+  scheduler/                 scheduler runtime, client, and entry point
+  config.ts                  environment validation and safety locks
+  logging.ts                 JSON logging and sanitization
+  README.md                  worker/scheduler contract, limits, egress, activation
 ```
 
 ## CI
@@ -390,41 +488,48 @@ worker/
 `.github/workflows/ci.yml` has two jobs:
 
 - **verify** — `npm ci`, lint, type check, Vitest, production build without
-  Supabase credentials, and `npm audit --omit=dev`.
-- **database** — Supabase CLI 2.122.0, `supabase start`, `supabase db reset`,
-  `supabase test db --local`, and `supabase db lint --local --level warning`.
+  Supabase credentials, `npm run test:checker`, `npm run test:worker`,
+  `npm run worker:build`, and `npm audit --omit=dev`.
+- **database** — Supabase CLI 2.122.0, `npm ci`, `supabase start`, `supabase db reset`,
+  pgTAP tests, `npm run test:phase4b`, and
+  `supabase db lint --local --level warning`.
 
 The workflow does not deploy or push anything. The `phase-1/**`, `phase-2/**`,
-`phase-3/**`, `phase-4/**`, and `phase-4a/**` branch patterns are included in
-the push filter.
+`phase-3/**`, `phase-4/**`, `phase-4a/**`, and `phase-4b/**` branch patterns
+are included in the push filter.
 
 ## Verification status
 
-Verified locally on 2026-11-01:
+Verified locally on 2026-11-04:
 
 | Check | Result |
 | --- | --- |
 | `npm run lint` | Pass, no findings |
 | `npm run typecheck` | Pass |
-| `npm test` | 331 tests across 25 files pass |
+| `npm test` | 390 tests across 32 files pass |
 | `npm run test:checker` | 160 checker tests across 7 files pass |
+| `npm run test:worker` | 59 worker/scheduler tests across 7 files pass |
+| `npm run test:scheduler` | 5 scheduler tests across 1 file pass |
+| `npm run test:phase4b` | 9 database pipeline tests pass using four restricted-role connections |
 | `npm run build` (no Supabase env) | Pass |
+| `npm run worker:build` | Pass |
 | `npm audit --omit=dev` | 0 vulnerabilities |
-| `npm run db:reset` | 8 migrations + seed pass |
-| `npm run db:test` | 211 assertions across 7 files pass |
+| `npm run db:reset` | 9 migrations + seed pass |
+| `npm run db:test` | 276 assertions across 8 files pass |
 | `npm run db:lint` | No schema errors |
 | Phase 4A preflight (read-only, local) | 3 monitors, 0 blocking, 0 unexpected error classes |
 
-Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite. Phase 4A.1 checker coverage is application-level plus local TLS; it does not prove production TLS against a publicly trusted CA or deployment egress isolation, which remain release gates.
+Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite. Phase 4A.1 checker coverage is application-level plus local TLS; it does not prove production TLS against a publicly trusted CA or deployment egress isolation, which remain release gates. Phase 4B coverage proves the local fixtures pipeline and permission split; it does not prove customer execution, multi-region behavior, or hosted egress isolation.
 
-## Known gaps before Phase 4B
+## Known gaps and limits
 
+- Customer monitoring is not active. Phase 4B runs only operator-allowlisted
+  fixtures; the execution gate is disabled by default and `customer` mode is
+  rejected by both the worker and the database functions. There is no customer
+  test-check action, alert delivery, incident automation, or public status-page
+  UI.
 - Auth E2E is manual only; no Playwright suite runs in CI. Re-run the manual
   checklist above after auth changes.
-- Monitoring execution is not wired up. Phase 4A.1 provides a standalone checker
-  and result-metric columns, but there is no scheduler, worker service,
-  test-check action, result ingestion, alert delivery, or public status-page UI.
-  Saved configurations are not checked.
 - The Phase 4A.1 TLS suite does not prove production TLS against a publicly
   trusted CA, a corporate proxy, a custom trust store, or a host with clock skew.
   IPv6 routing and dual-stack fallback are unverified. These remain deployment
@@ -441,10 +546,14 @@ Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated i
   repository. The worker host must deny private, link-local, loopback, metadata,
   control-plane, and Supabase private-network egress. If it cannot, customer
   checks are a release blocker.
-- The worker role is a global scheduler role: it can read monitoring and
-  alerting rows across tenants, but not profiles, organizations, audit logs, or
-  status pages. Phase 4B must split checker/scheduler/ingestor permissions and
-  keep secrets away from the checker.
+- The Phase 4B integration test is local-only. Multi-region routing,
+  confirmation/quorum, failure injection, and a 1,000-monitor load test remain
+  unverified.
+- The legacy `onedash_worker` role is retained as a deprecated NOLOGIN role with
+  no direct table, sequence, function, schema, or policy grants. `PUBLIC` still
+  exposes schema `USAGE`, but the role has no data access. New processes must
+  use the split `onedash_scheduler`, `onedash_queue`, and `onedash_ingestor`
+  roles.
 - The monitor limit is a development guard, not plan/billing enforcement.
   There is no Stripe integration or entitlement model.
 - The monitor list is capped at 200 rows with no pagination. The database limit

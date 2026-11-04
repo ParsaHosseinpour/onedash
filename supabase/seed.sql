@@ -521,3 +521,22 @@ values
     0
   )
 on conflict (status_page_id, monitor_id) do nothing;
+
+-- ------------------------------------------------------------
+-- Phase 4B local fixture allowlist
+-- ------------------------------------------------------------
+-- These rows only permit the seeded .test monitors to be scheduled while the
+-- execution gate is explicitly switched to fixtures mode by a developer. The
+-- gate remains disabled by default and no worker is started by db reset.
+
+insert into public.monitor_execution_allowlist (
+  monitor_id, organization_id, reason
+)
+select id, organization_id, 'local development fixture'
+from public.monitors
+where id in (
+  'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+  'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+)
+on conflict (monitor_id) do nothing;

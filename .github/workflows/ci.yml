@@ -9,6 +9,7 @@ on:
       - "phase-3/**"
       - "phase-4/**"
       - "phase-4a/**"
+      - "phase-4b/**"
   pull_request:
 
 permissions:
@@ -45,6 +46,15 @@ jobs:
       - name: Unit and integration tests
         run: npm test
 
+      - name: Checker tests
+        run: npm run test:checker
+
+      - name: Worker and scheduler tests
+        run: npm run test:worker
+
+      - name: Build worker and scheduler
+        run: npm run worker:build
+
       - name: Production build without Supabase credentials
         run: npm run build
 
@@ -60,6 +70,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Set up Supabase CLI
         uses: supabase/setup-cli@v1
         with:
@@ -73,6 +92,9 @@ jobs:
 
       - name: Run pgTAP database tests
         run: supabase test db --local
+
+      - name: Run Phase 4B database pipeline test
+        run: npm run test:phase4b
 
       - name: Lint database functions
         run: supabase db lint --local --level warning

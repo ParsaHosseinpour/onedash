@@ -33,6 +33,10 @@ select is(
         'audit_logs',
         'monitor_request_secrets',
         'monitor_limit_settings',
+        'monitor_execution_settings',
+        'monitor_execution_allowlist',
+        'check_jobs',
+        'service_heartbeats',
         'waitlist'
       )
       and not c.relrowsecurity
