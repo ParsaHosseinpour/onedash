@@ -1,6 +1,7 @@
 import {
   CHECK_ERROR_CLASSES,
   CHECK_STATUSES,
+  SAFE_MESSAGES,
   type CheckErrorClass,
   type CheckResult,
   type CheckStatus,
@@ -83,7 +84,13 @@ export function toIngestPayload(result: CheckResult): IngestCheckResult {
   }
 
   const errorMessage = result.errorMessage;
-  if (errorMessage !== null && errorMessage.length > 1000) {
+  if (errorClass === null) {
+    if (errorMessage !== null) {
+      throw new InvalidCheckResultError("errorMessage");
+    }
+  } else if (errorMessage !== SAFE_MESSAGES[errorClass]) {
+    // The database accepts only the fixed checker vocabulary. Free-form error
+    // text can contain a hostname, response body, or header value.
     throw new InvalidCheckResultError("errorMessage");
   }
 

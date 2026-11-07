@@ -4,6 +4,7 @@ import {
   CheckerError,
   TransportError,
 } from "./checker";
+import type { JobErrorClass } from "./queue/queue-client";
 
 export type LogFields = Record<string, unknown>;
 
@@ -50,7 +51,6 @@ const ALLOWED_FIELDS = new Set([
   "dbExecutionMode",
   "mode",
   "port",
-  "host",
   "queueDepth",
   "oldestJobAgeSeconds",
   "schedulerDelaySeconds",
@@ -65,8 +65,16 @@ const ALLOWED_FIELDS = new Set([
   "queueMetricsError",
 ]);
 
+/**
+ * Reasons are fixed operational codes, not user text. Anything that could be a
+ * URL, hostname, email address, filesystem path, or free-form message is
+ * replaced wholesale so a hostname cannot survive sanitisation.
+ */
 export function sanitizeReason(value: string): string {
-  return value.replace(/[^a-zA-Z0-9_.:-]/g, "_").slice(0, 60) || "unknown";
+  const trimmed = value.trim();
+  if (!trimmed) return "unknown";
+  if (!/^[A-Za-z0-9_:-]{1,60}$/.test(trimmed)) return "redacted";
+  return trimmed;
 }
 
 function sanitizeErrorCode(value: unknown): string | null {
@@ -168,16 +176,43 @@ export function classifyError(error: unknown): {
   return { errorClass: "worker_error", errorCode: null };
 }
 
-export function jobErrorClass(
-  error: unknown,
-): "timeout" | "blocked_target" | "worker_error" {
-  if (error instanceof CheckTimeoutError) return "timeout";
+export type JobFailureDisposition = {
+  errorClass: JobErrorClass;
+  retryable: boolean;
+};
+
+/**
+ * Explicit retry policy. Transient transport, process, and internal failures
+ * retry with backoff. A blocked target is an authorization decision and is
+ * dead-lettered immediately. Unsupported configuration is also permanent for
+ * the current monitor version and must not consume five retry attempts.
+ */
+export function jobFailureDisposition(error: unknown): JobFailureDisposition {
+  if (error instanceof CheckTimeoutError) {
+    return { errorClass: "timeout", retryable: true };
+  }
   if (error instanceof CheckerError) {
-    if (error.errorClass === "timeout") return "timeout";
-    if (error.errorClass === "blocked_target") return "blocked_target";
+    if (error.errorClass === "timeout") {
+      return { errorClass: "timeout", retryable: true };
+    }
+    if (error.errorClass === "blocked_target") {
+      return { errorClass: "blocked_target", retryable: false };
+    }
+    if (error.errorClass === "unsupported_configuration") {
+      return { errorClass: "worker_error", retryable: false };
+    }
+    return { errorClass: "worker_error", retryable: true };
   }
-  if (error instanceof TransportError && error.kind === "timeout") {
-    return "timeout";
+  if (error instanceof TransportError) {
+    return {
+      errorClass: error.kind === "timeout" ? "timeout" : "worker_error",
+      retryable: true,
+    };
   }
-  return "worker_error";
+  return { errorClass: "worker_error", retryable: true };
+}
+
+/** Backwards-compatible error-class-only view of the retry policy. */
+export function jobErrorClass(error: unknown): JobErrorClass {
+  return jobFailureDisposition(error).errorClass;
 }

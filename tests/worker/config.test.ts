@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ConfigurationError,
+  isFixtureHostname,
   isValidHostname,
   isValidRegion,
   loadSchedulerConfig,
@@ -66,6 +67,28 @@ describe("loadWorkerConfig", () => {
     ).toThrow(/invalid hostname/);
   });
 
+  it.each(["customer.example", "localhost", "api.localhost", "127.0.0.1"])(
+    "rejects non-.test fixture host %s",
+    (host) => {
+      expect(() =>
+        loadWorkerConfig({
+          ...baseEnv,
+          ONEDASH_WORKER_EXECUTION_MODE: "fixtures",
+          ONEDASH_FIXTURE_HOSTS: host,
+        }),
+      ).toThrow(/\.test/);
+    },
+  );
+
+  it("rejects a region outside the bounded registry", () => {
+    expect(() =>
+      loadWorkerConfig({
+        ...baseEnv,
+        ONEDASH_REGION: "moon-1",
+      }),
+    ).toThrow(/supported region/);
+  });
+
   it("requires a metrics token for non-loopback health binding", () => {
     expect(() =>
       loadWorkerConfig({
@@ -122,6 +145,12 @@ describe("loadSchedulerConfig", () => {
       loadSchedulerConfig({ ...baseEnv, ONEDASH_SCHEDULER_REGION: "US East" }),
     ).toThrow(/lowercase/);
   });
+
+  it("rejects an unsupported scheduler region", () => {
+    expect(() =>
+      loadSchedulerConfig({ ...baseEnv, ONEDASH_SCHEDULER_REGION: "moon-1" }),
+    ).toThrow(/supported region/);
+  });
 });
 
 describe("hostname and region validation", () => {
@@ -144,5 +173,15 @@ describe("hostname and region validation", () => {
   it("rejects unsafe region identifiers", () => {
     expect(isValidRegion("US")).toBe(false);
     expect(isValidRegion("us_east")).toBe(false);
+  });
+
+  it("accepts only .test fixture hostnames", () => {
+    expect(isFixtureHostname("fixture.test")).toBe(true);
+    expect(isFixtureHostname("api.fixture.test")).toBe(true);
+    expect(isFixtureHostname("customer.example")).toBe(false);
+    expect(isFixtureHostname("localhost")).toBe(false);
+    expect(isFixtureHostname("api.localhost")).toBe(false);
+    expect(isFixtureHostname("127.0.0.1")).toBe(false);
+    expect(isFixtureHostname(".test")).toBe(false);
   });
 });

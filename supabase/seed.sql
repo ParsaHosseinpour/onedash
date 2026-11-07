@@ -530,9 +530,9 @@ on conflict (status_page_id, monitor_id) do nothing;
 -- gate remains disabled by default and no worker is started by db reset.
 
 insert into public.monitor_execution_allowlist (
-  monitor_id, organization_id, reason
+  monitor_id, organization_id, url, reason
 )
-select id, organization_id, 'local development fixture'
+select id, organization_id, url, 'local development fixture'
 from public.monitors
 where id in (
   'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',

@@ -9,6 +9,8 @@ import {
   classifyError,
   createJsonLogger,
   jobErrorClass,
+  jobFailureDisposition,
+  sanitizeReason,
 } from "../../worker/logging";
 
 function captureLogger(level: "debug" | "info" | "warn" | "error" = "debug") {
@@ -79,8 +81,25 @@ describe("createJsonLogger", () => {
     });
 
     const entry = JSON.parse(lines[0]);
-    expect(entry.reason).toBe("lease_lost_https:__customer.example");
+    expect(entry.reason).toBe("redacted");
     expect(entry.errorCode).toBeUndefined();
+  });
+
+  it("keeps fixed reason codes but redacts hostnames, URLs, and paths", () => {
+    expect(sanitizeReason("lease_lost")).toBe("lease_lost");
+    expect(sanitizeReason("execution_disabled:fixtures")).toBe(
+      "execution_disabled:fixtures",
+    );
+    for (const value of [
+      "https://customer.example/private",
+      "customer.example",
+      "person@example.com",
+      "C:\\secrets\\config",
+      "lease lost at customer.example",
+      "x".repeat(61),
+    ]) {
+      expect(sanitizeReason(value)).toBe("redacted");
+    }
   });
 
   it("filters below the configured level", () => {
@@ -165,5 +184,37 @@ describe("jobErrorClass", () => {
       "worker_error",
     );
     expect(jobErrorClass(new Error("unexpected"))).toBe("worker_error");
+  });
+});
+
+describe("jobFailureDisposition", () => {
+  it("retries transient timeout and transport failures", () => {
+    expect(jobFailureDisposition(new CheckerError("timeout", SAFE_MESSAGES.timeout))).toEqual({
+      errorClass: "timeout",
+      retryable: true,
+    });
+    expect(jobFailureDisposition(new TransportError("connection_failure"))).toEqual({
+      errorClass: "worker_error",
+      retryable: true,
+    });
+  });
+
+  it("dead-letters blocked targets immediately", () => {
+    expect(
+      jobFailureDisposition(
+        new CheckerError("blocked_target", SAFE_MESSAGES.blocked_target),
+      ),
+    ).toEqual({ errorClass: "blocked_target", retryable: false });
+  });
+
+  it("does not retry unsupported monitor configuration", () => {
+    expect(
+      jobFailureDisposition(
+        new CheckerError(
+          "unsupported_configuration",
+          SAFE_MESSAGES.unsupported_configuration,
+        ),
+      ),
+    ).toEqual({ errorClass: "worker_error", retryable: false });
   });
 });

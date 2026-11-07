@@ -1,4 +1,5 @@
-import { createFixtureChecker, createLockedChecker } from "../checker/adapter";
+import { createProcessChecker } from "../checker/process-client";
+import { createLockedChecker } from "../checker/adapter";
 import {
   ConfigurationError,
   loadWorkerConfig,
@@ -39,7 +40,10 @@ async function main(): Promise<void> {
 
   const checker =
     config.executionMode === "fixtures"
-      ? createFixtureChecker()
+      ? createProcessChecker({
+          executionMode: "fixtures",
+          allowedHosts: config.fixtureHosts,
+        })
       : createLockedChecker();
 
   const runtime = new WorkerRuntime({
@@ -101,7 +105,6 @@ async function main(): Promise<void> {
     const address = await health.start();
     runtime.start();
     logger.info("worker_listening", {
-      host: address.host,
       port: address.port,
       executionMode: config.executionMode,
       region: config.region,

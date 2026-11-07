@@ -126,4 +126,56 @@ describe("toIngestPayload", () => {
       ),
     ).toThrow(/errorMessage/);
   });
+
+  it("accepts only the fixed safe message for an error class", () => {
+    expect(
+      toIngestPayload(
+        validResult({
+          status: "down",
+          errorClass: "timeout",
+          errorMessage: "The check timed out.",
+        }),
+      ),
+    ).toMatchObject({
+      status: "down",
+      error_class: "timeout",
+      error_message: "The check timed out.",
+    });
+
+    for (const errorMessage of [
+      "timeout at https://customer.example/private",
+      "The destination timed out.",
+      "",
+    ]) {
+      expect(() =>
+        toIngestPayload(
+          validResult({
+            status: "down",
+            errorClass: "timeout",
+            errorMessage,
+          }),
+        ),
+      ).toThrow(/errorMessage/);
+    }
+  });
+
+  it("rejects an error message on a successful result", () => {
+    expect(() =>
+      toIngestPayload(
+        validResult({ errorMessage: "leaked https://customer.example" }),
+      ),
+    ).toThrow(/errorMessage/);
+  });
+
+  it("rejects a failed result without an error class", () => {
+    expect(() =>
+      toIngestPayload(
+        validResult({
+          status: "error",
+          errorClass: null,
+          errorMessage: null,
+        }),
+      ),
+    ).toThrow(/errorClass/);
+  });
 });

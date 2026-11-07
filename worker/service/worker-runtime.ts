@@ -1,5 +1,6 @@
-import { CheckCancelledError } from "../checker";
+import { CheckCancelledError, CheckTimeoutError } from "../checker";
 import type { WorkerChecker } from "../checker/adapter";
+import { toMonitorCheckConfig } from "../checker/config";
 import type { WorkerConfig } from "../config";
 import type {
   IngestCheckResult,
@@ -8,7 +9,7 @@ import { toIngestPayload } from "../ingestor/result-payload";
 import type { IngestResult } from "../ingestor/ingestor-client";
 import {
   classifyError,
-  jobErrorClass,
+  jobFailureDisposition,
   sanitizeReason,
   type Logger,
 } from "../logging";
@@ -90,17 +91,20 @@ export type WorkerRuntimeMetrics = {
   checkDurationMaxMs: number;
   lastClaimAt: string | null;
   lastHeartbeatAt: string | null;
+  lastHardTimeoutAt: string | null;
   lastErrorClass: string | null;
 };
 
 export type WorkerHealth = {
-  status: "ok" | "stopping";
+  status: "ok" | "degraded" | "stopping";
   executionMode: string;
   dbExecutionMode: string;
   dbReady: boolean;
   region: string;
   inFlight: number;
   concurrency: number;
+  overdueJobs: number;
+  lastHardTimeoutAt: string | null;
   startedAt: string | null;
   uptimeSeconds: number;
 };
@@ -121,11 +125,14 @@ export class WorkerRuntime {
   private readonly shutdownController = new AbortController();
   private readonly inFlight = new Map<string, Promise<void>>();
   private readonly jobControllers = new Map<string, AbortController>();
+  private readonly jobDeadlines = new Map<string, number>();
+  private readonly lateChecks = new Set<string>();
 
   private lastHeartbeatAtMs = 0;
   private lastReapAtMs = 0;
   private lastClaimAt: string | null = null;
   private lastHeartbeatAt: string | null = null;
+  private lastHardTimeoutAtMs: number | null = null;
   private lastDbExecutionMode = "unknown";
   private lastLoggedExecutionMode: string | null = null;
   private dbReady = false;
@@ -201,20 +208,39 @@ export class WorkerRuntime {
   getHealth(): WorkerHealth {
     const startedAt =
       this.startedAtMs === null ? null : new Date(this.startedAtMs).toISOString();
+    const overdueJobs = this.countOverdueJobs() + this.lateChecks.size;
     return {
-      status: this.stopping ? "stopping" : "ok",
+      status: this.stopping
+        ? "stopping"
+        : overdueJobs > 0
+          ? "degraded"
+          : "ok",
       executionMode: this.config.executionMode,
       dbExecutionMode: this.lastDbExecutionMode,
       dbReady: this.dbReady,
       region: this.config.region,
       inFlight: this.inFlight.size,
       concurrency: this.config.concurrency,
+      overdueJobs,
+      lastHardTimeoutAt:
+        this.lastHardTimeoutAtMs === null
+          ? null
+          : new Date(this.lastHardTimeoutAtMs).toISOString(),
       startedAt,
       uptimeSeconds:
         this.startedAtMs === null
           ? 0
           : Math.max(0, Math.floor((this.now() - this.startedAtMs) / 1000)),
     };
+  }
+
+  private countOverdueJobs(): number {
+    const now = this.now();
+    let overdue = 0;
+    for (const [jobId, deadline] of this.jobDeadlines) {
+      if (now >= deadline && !this.lateChecks.has(jobId)) overdue += 1;
+    }
+    return overdue;
   }
 
   getMetrics(): WorkerRuntimeMetrics {
@@ -239,6 +265,10 @@ export class WorkerRuntime {
       checkDurationMaxMs: this.checkDurationMaxMs,
       lastClaimAt: this.lastClaimAt,
       lastHeartbeatAt: this.lastHeartbeatAt,
+      lastHardTimeoutAt:
+        this.lastHardTimeoutAtMs === null
+          ? null
+          : new Date(this.lastHardTimeoutAtMs).toISOString(),
       lastErrorClass: this.lastErrorClass,
     };
   }
@@ -359,6 +389,12 @@ export class WorkerRuntime {
     let timedOut = false;
     let leaseLost = false;
     let leaseExtensionInFlight = false;
+    let checkSettled = false;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+
+    const deadlineMs = Math.max(1000, (job.timeoutSeconds + 5) * 1000);
+    const deadlineAt = this.now() + deadlineMs;
+    this.jobDeadlines.set(job.jobId, deadlineAt);
 
     this.logger.info("job_started", {
       jobId: job.jobId,
@@ -369,11 +405,20 @@ export class WorkerRuntime {
 
     const leaseTimer = setInterval(
       () => {
-        if (leaseExtensionInFlight || controller.signal.aborted) return;
+        if (
+          leaseExtensionInFlight ||
+          timedOut ||
+          this.stopping ||
+          controller.signal.aborted ||
+          this.now() >= deadlineAt
+        ) {
+          return;
+        }
         leaseExtensionInFlight = true;
         void this.queue
           .extendLease(job.jobId, job.leaseToken, this.config.leaseSeconds)
           .then((extended) => {
+            if (timedOut) return;
             if (extended) return;
             leaseLost = true;
             if (!controller.signal.aborted) {
@@ -382,6 +427,7 @@ export class WorkerRuntime {
             this.logger.warn("lease_lost", { jobId: job.jobId });
           })
           .catch((error) => {
+            if (timedOut) return;
             leaseLost = true;
             if (!controller.signal.aborted) {
               controller.abort(new CheckCancelledError());
@@ -401,16 +447,29 @@ export class WorkerRuntime {
     );
     leaseTimer.unref?.();
 
-    const timeoutTimer = setTimeout(
-      () => {
-        timedOut = true;
-        if (!controller.signal.aborted) {
-          controller.abort(new CheckCancelledError());
-        }
-      },
-      Math.max(1000, (job.timeoutSeconds + 5) * 1000),
-    );
-    timeoutTimer.unref?.();
+    const deadlinePromise = new Promise<never>((_resolve, reject) => {
+      timeoutTimer = setTimeout(
+        () => {
+          timedOut = true;
+          this.lastHardTimeoutAtMs = this.now();
+          // The job is settled and failed below, but the checker promise may
+          // still be alive because it ignored the abort signal. Keep it visible
+          // to readiness until it actually settles. If the checker already
+          // settled, this deadline belongs to a slow ingestion/failure path;
+          // countOverdueJobs already exposes that through jobDeadlines.
+          if (!checkSettled) {
+            this.lateChecks.add(job.jobId);
+          }
+          clearInterval(leaseTimer);
+          if (!controller.signal.aborted) {
+            controller.abort(new CheckTimeoutError());
+          }
+          reject(new CheckTimeoutError());
+        },
+        deadlineMs,
+      );
+      timeoutTimer.unref?.();
+    });
 
     try {
       if (this.stopping) {
@@ -418,7 +477,30 @@ export class WorkerRuntime {
         return;
       }
 
-      const result = await this.checker.check(job, controller.signal);
+      const checkConfig = toMonitorCheckConfig(job);
+      const checkPromise = Promise.resolve().then(() =>
+        this.checker.check(checkConfig, controller.signal),
+      );
+      // A checker may ignore AbortSignal and settle long after the hard
+      // deadline. This handler keeps the detached late result from becoming an
+      // unhandled rejection; it is never ingested. It also clears the degraded
+      // readiness marker once the abandoned checker finally settles.
+      void checkPromise
+        .catch(() => undefined)
+        .finally(() => {
+          checkSettled = true;
+          this.lateChecks.delete(job.jobId);
+        });
+
+      const result = await Promise.race([checkPromise, deadlinePromise]);
+
+      if (timedOut || this.now() >= deadlineAt) {
+        throw new CheckTimeoutError();
+      }
+      if (controller.signal.aborted) {
+        throw controller.signal.reason ?? new CheckCancelledError();
+      }
+
       const checkDurationMs = result.totalMs;
       this.recordCheckDuration(checkDurationMs);
       if (result.errorClass === "timeout") {
@@ -443,6 +525,13 @@ export class WorkerRuntime {
         duplicate: ingest.duplicate,
       });
     } catch (error) {
+      if (timedOut || error instanceof CheckTimeoutError) {
+        timedOut = true;
+        this.timeoutTotal += 1;
+        await this.failSafely(job, "timeout", true);
+        return;
+      }
+
       if (error instanceof CheckCancelledError || controller.signal.aborted) {
         if (this.stopping) {
           await this.releaseSafely(job);
@@ -451,26 +540,29 @@ export class WorkerRuntime {
             jobId: job.jobId,
             reason: "lease_lost",
           });
-        } else if (timedOut) {
-          this.timeoutTotal += 1;
-          await this.failSafely(job, "timeout");
         } else {
-          await this.failSafely(job, "worker_error");
+          await this.failSafely(job, "worker_error", true);
         }
         return;
       }
 
       const classified = classifyError(error);
+      const disposition = jobFailureDisposition(error);
       this.lastErrorClass = classified.errorClass;
       this.logger.error("job_failed", {
         jobId: job.jobId,
         errorClass: classified.errorClass,
         errorCode: classified.errorCode,
       });
-      await this.failSafely(job, jobErrorClass(error));
+      await this.failSafely(
+        job,
+        disposition.errorClass,
+        disposition.retryable,
+      );
     } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       clearInterval(leaseTimer);
-      clearTimeout(timeoutTimer);
+      this.jobDeadlines.delete(job.jobId);
     }
   }
 
@@ -501,13 +593,17 @@ export class WorkerRuntime {
     }
   }
 
-  private async failSafely(job: ClaimedJob, errorClass: JobErrorClass): Promise<void> {
+  private async failSafely(
+    job: ClaimedJob,
+    errorClass: JobErrorClass,
+    retryable: boolean,
+  ): Promise<void> {
     try {
       const result = await this.queue.failJob(
         job.jobId,
         job.leaseToken,
         errorClass,
-        true,
+        retryable,
       );
       if (!result.ok) {
         this.logger.warn("job_failure_rejected", {

@@ -224,6 +224,7 @@ class FakeIngestor implements WorkerIngestor {
     leaseToken: string;
     result: IngestCheckResult;
   }> = [];
+  hold: Promise<void> | null = null;
 
   async ingest(
     jobId: string,
@@ -231,6 +232,7 @@ class FakeIngestor implements WorkerIngestor {
     result: IngestCheckResult,
   ): Promise<IngestResult> {
     this.ingests.push({ jobId, leaseToken, result });
+    if (this.hold) await this.hold;
     return this.result;
   }
 
@@ -293,7 +295,11 @@ describe("WorkerRuntime runOnce", () => {
   it("claims only free concurrency slots and releases overflow", async () => {
     const queue = new FakeQueue();
     queue.claimResult = {
-      jobs: [job({ jobId: "job-1" }), job({ jobId: "job-2" }), job({ jobId: "job-3" })],
+      jobs: [
+        job({ jobId: "job-1", url: "https://fixture.test/job-1" }),
+        job({ jobId: "job-2", url: "https://fixture.test/job-2" }),
+        job({ jobId: "job-3", url: "https://fixture.test/job-3" }),
+      ],
       executionMode: "fixtures",
       reason: null,
       claimedAt: null,
@@ -303,7 +309,7 @@ describe("WorkerRuntime runOnce", () => {
     const checker: WorkerChecker = {
       check: (claimed) =>
         new Promise<CheckResult>((resolve) => {
-          resolvers.set(claimed.jobId, resolve);
+          resolvers.set(claimed.url, resolve);
         }),
     };
 
@@ -315,8 +321,8 @@ describe("WorkerRuntime runOnce", () => {
     expect(queue.releases[0].jobId).toBe("job-3");
     expect(runtime.getMetrics().inFlight).toBe(2);
 
-    resolvers.get("job-1")?.(checkResult());
-    resolvers.get("job-2")?.(checkResult());
+    resolvers.get("https://fixture.test/job-1")?.(checkResult());
+    resolvers.get("https://fixture.test/job-2")?.(checkResult());
     await runtime.waitForIdle();
     expect(runtime.getMetrics().completedTotal).toBe(2);
   });
@@ -368,6 +374,72 @@ describe("WorkerRuntime runOnce", () => {
     expect(queue.failures[0].retryable).toBe(true);
     expect(runtime.getMetrics().retriedTotal).toBe(1);
     expect(runtime.getMetrics().completedTotal).toBe(0);
+  });
+
+  it("dead-letters an unauthorized target without retrying", async () => {
+    const queue = new FakeQueue();
+    queue.claimResult = {
+      jobs: [job()],
+      executionMode: "fixtures",
+      reason: null,
+      claimedAt: null,
+    };
+    queue.failResult = {
+      ok: true,
+      status: "dead_letter",
+      retryAt: null,
+      reason: null,
+    };
+    const checker: WorkerChecker = {
+      async check() {
+        throw new CheckerError("blocked_target", SAFE_MESSAGES.blocked_target);
+      },
+    };
+    const { runtime } = setup({ queue, checker });
+
+    await runtime.runOnce();
+    await runtime.waitForIdle();
+
+    expect(queue.failures[0]).toMatchObject({
+      errorClass: "blocked_target",
+      retryable: false,
+    });
+    expect(runtime.getMetrics().failedTotal).toBe(1);
+    expect(runtime.getMetrics().retriedTotal).toBe(0);
+  });
+
+  it("dead-letters an unsupported monitor configuration without retrying", async () => {
+    const queue = new FakeQueue();
+    queue.claimResult = {
+      jobs: [job()],
+      executionMode: "fixtures",
+      reason: null,
+      claimedAt: null,
+    };
+    queue.failResult = {
+      ok: true,
+      status: "dead_letter",
+      retryAt: null,
+      reason: null,
+    };
+    const checker: WorkerChecker = {
+      async check() {
+        throw new CheckerError(
+          "unsupported_configuration",
+          SAFE_MESSAGES.unsupported_configuration,
+        );
+      },
+    };
+    const { runtime } = setup({ queue, checker });
+
+    await runtime.runOnce();
+    await runtime.waitForIdle();
+
+    expect(queue.failures[0]).toMatchObject({
+      errorClass: "worker_error",
+      retryable: false,
+    });
+    expect(runtime.getMetrics().failedTotal).toBe(1);
   });
 
   it("counts a dead-letter terminal failure", async () => {
@@ -487,5 +559,108 @@ describe("WorkerRuntime runOnce", () => {
     expect(queue.failures).toHaveLength(1);
     expect(queue.failures[0].errorClass).toBe("timeout");
     expect(runtime.getMetrics().timeoutTotal).toBe(1);
+  });
+
+  it("hard-times out a checker that ignores the abort signal and never ingests its late result", async () => {
+    vi.useFakeTimers();
+    const queue = new FakeQueue();
+    queue.claimResult = {
+      jobs: [job({ timeoutSeconds: 5 })],
+      executionMode: "fixtures",
+      reason: null,
+      claimedAt: null,
+    };
+
+    let resolveCheck!: (value: CheckResult) => void;
+    const checker: WorkerChecker = {
+      check: () =>
+        new Promise<CheckResult>((resolve) => {
+          resolveCheck = resolve;
+        }),
+    };
+    const { runtime, ingestor } = setup({
+      queue,
+      checker,
+      config: { leaseSeconds: 30 },
+    });
+
+    await runtime.runOnce();
+    // The hard deadline is timeoutSeconds + 5 seconds.
+    await vi.advanceTimersByTimeAsync(10_000);
+    await runtime.waitForIdle();
+
+    expect(queue.failures).toHaveLength(1);
+    expect(queue.failures[0]).toMatchObject({
+      errorClass: "timeout",
+      retryable: true,
+    });
+    expect(ingestor.ingests).toHaveLength(0);
+    expect(runtime.getMetrics()).toMatchObject({
+      timeoutTotal: 1,
+      completedTotal: 0,
+    });
+    expect(runtime.getMetrics().lastHardTimeoutAt).not.toBeNull();
+    expect(runtime.getHealth()).toMatchObject({
+      status: "degraded",
+      overdueJobs: 1,
+    });
+
+    // The lease extension interval is 15 seconds, but it must remain stopped
+    // after the 10 second hard deadline.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(queue.extensions).toHaveLength(0);
+
+    resolveCheck(checkResult());
+    await vi.advanceTimersByTimeAsync(0);
+    await runtime.waitForIdle();
+    await Promise.resolve();
+
+    expect(ingestor.ingests).toHaveLength(0);
+    expect(runtime.getHealth()).toMatchObject({
+      status: "ok",
+      overdueJobs: 0,
+    });
+  });
+
+  it("clears deadline readiness after a checker settled before a slow ingestion", async () => {
+    vi.useFakeTimers();
+    const queue = new FakeQueue();
+    queue.claimResult = {
+      jobs: [job({ timeoutSeconds: 5 })],
+      executionMode: "fixtures",
+      reason: null,
+      claimedAt: null,
+    };
+
+    const ingestor = new FakeIngestor();
+    let releaseIngest!: () => void;
+    ingestor.hold = new Promise<void>((resolve) => {
+      releaseIngest = resolve;
+    });
+    const { runtime } = setup({
+      queue,
+      ingestor,
+      config: { leaseSeconds: 30 },
+    });
+
+    await runtime.runOnce();
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    // The checker already settled, so this is an overdue ingestion, not an
+    // abandoned checker. Readiness must still recover once ingest completes.
+    expect(runtime.getHealth()).toMatchObject({
+      status: "degraded",
+      overdueJobs: 1,
+    });
+
+    releaseIngest();
+    await vi.advanceTimersByTimeAsync(0);
+    await runtime.waitForIdle();
+
+    expect(runtime.getHealth()).toMatchObject({
+      status: "ok",
+      overdueJobs: 0,
+    });
+    expect(ingestor.ingests).toHaveLength(1);
   });
 });

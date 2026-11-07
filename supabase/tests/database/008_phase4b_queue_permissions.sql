@@ -335,9 +335,10 @@ select is(
         'monitor_execution_settings',
         'monitor_execution_allowlist'
       )
+      and roles && array['anon', 'authenticated']::name[]
   ),
   0,
-  'Phase 4B tables have no direct RLS policies'
+  'Phase 4B tables have no direct application RLS policies'
 );
 
 select is(

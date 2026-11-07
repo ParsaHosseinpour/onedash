@@ -18,6 +18,28 @@ export type LogLevel = (typeof LOG_LEVELS)[number];
 
 export type WorkerExecutionMode = "disabled" | "fixtures";
 
+/**
+ * Deliberately bounded. The database has the same list in
+ * public.supported_regions; adding a region requires both a migration and a
+ * worker release so a typo cannot create an unbounded scheduling dimension.
+ */
+export const SUPPORTED_REGIONS = [
+  "global",
+  "local-1",
+  "us-east",
+  "us-west",
+  "eu-west",
+  "ap-south",
+  "test-1",
+  "test-2",
+] as const;
+
+export type SupportedRegion = (typeof SUPPORTED_REGIONS)[number];
+
+export function isSupportedRegion(value: string): boolean {
+  return (SUPPORTED_REGIONS as readonly string[]).includes(value);
+}
+
 export type WorkerConfig = {
   executionMode: WorkerExecutionMode;
   queueDatabaseUrl: string;
@@ -133,6 +155,9 @@ function readRegion(env: Env, key: string, defaultValue: string): string {
       `${key} must be 2-32 lowercase letters, digits, or single hyphens`,
     );
   }
+  if (!isSupportedRegion(value)) {
+    throw new ConfigurationError(`${key} must be a supported region`);
+  }
   return value;
 }
 
@@ -141,6 +166,15 @@ export function isValidHostname(value: string): boolean {
   return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/.test(
     value,
   );
+}
+
+export function isFixtureHostname(value: string): boolean {
+  if (!isValidHostname(value)) return false;
+  if (value === "localhost" || value.endsWith(".localhost")) return false;
+  if (!value.endsWith(".test") || value.length <= ".test".length) return false;
+  // isValidHostname permits dotted decimal labels; reject raw IPv4 literals.
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) return false;
+  return true;
 }
 
 function readFixtureHosts(env: Env): string[] {
@@ -161,6 +195,11 @@ function readFixtureHosts(env: Env): string[] {
     if (!isValidHostname(host)) {
       throw new ConfigurationError(
         "ONEDASH_FIXTURE_HOSTS contains an invalid hostname",
+      );
+    }
+    if (!isFixtureHostname(host)) {
+      throw new ConfigurationError(
+        "ONEDASH_FIXTURE_HOSTS must contain only .test hostnames",
       );
     }
   }

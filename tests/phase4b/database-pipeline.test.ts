@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "pg";
+import { SAFE_MESSAGES } from "../../worker/checker";
 import { createFixtureChecker } from "../../worker/checker/adapter";
 import { IngestorClient } from "../../worker/ingestor/ingestor-client";
 import { createSilentLogger } from "../../worker/logging";
@@ -18,7 +19,11 @@ const TEST_ROLES = [
 const TEST_MONITOR_ID = "d4b00000-0000-4000-8000-000000000001";
 const TEST_MONITOR_ID_2 = "d4b00000-0000-4000-8000-000000000002";
 const TEST_MONITOR_ID_3 = "d4b00000-0000-4000-8000-000000000003";
+const TEST_MONITOR_ID_4 = "d4b00000-0000-4000-8000-000000000004";
+const TEST_MONITOR_ID_5 = "d4b00000-0000-4000-8000-000000000005";
+const TEST_MONITOR_ID_6 = "d4b00000-0000-4000-8000-000000000006";
 const TEST_REGION = "test-1";
+const TEST_REGION_2 = "test-2";
 const TEST_HOST = "phase4b-fixture.test";
 const TEST_URL = `https://${TEST_HOST}/health`;
 const TEST_WORKER_ID = "phase4b-worker";
@@ -117,11 +122,137 @@ type ExecutionSettings = {
   egress_verified_by: string | null;
 };
 
+type AckResult = {
+  ok: boolean;
+  duplicate?: boolean;
+  job_status?: string;
+  result_id?: string;
+  reason?: string;
+};
+
+type ReleaseResult = {
+  ok: boolean;
+  status?: string;
+  reason?: string;
+};
+
+async function insertPendingJob(
+  monitorId: string,
+  key: string,
+  options: {
+    region?: string;
+    offsetSeconds?: number;
+    maxAttempts?: number;
+  } = {},
+): Promise<string> {
+  const result = await admin!.query(
+    `insert into public.check_jobs (
+       organization_id, monitor_id, region, scheduled_for, available_at,
+       idempotency_key, status, max_attempts
+     )
+     select
+       organization_id,
+       id,
+       $2,
+       now() + make_interval(secs => $3),
+       now() + make_interval(secs => $3),
+       $4,
+       'pending',
+       $5
+     from public.monitors
+     where id = $1
+     returning id`,
+    [
+      monitorId,
+      options.region ?? TEST_REGION_2,
+      options.offsetSeconds ?? 0,
+      key,
+      options.maxAttempts ?? 5,
+    ],
+  );
+  expect(result.rowCount).toBe(1);
+  return result.rows[0].id as string;
+}
+
+async function claimFrom(
+  client: Client,
+  workerId: string,
+  batchSize: number,
+  region = TEST_REGION_2,
+): Promise<ClaimResult> {
+  return jsonResult<ClaimResult>(
+    client,
+    "select public.onedash_claim_jobs($1, $2, $3, $4, $5::text[]) as result",
+    [workerId, region, 60, batchSize, [TEST_HOST]],
+  );
+}
+
+async function cleanupNewMonitors(): Promise<void> {
+  const ids = [TEST_MONITOR_ID_4, TEST_MONITOR_ID_5, TEST_MONITOR_ID_6];
+  await admin!.query(
+    "delete from public.check_jobs where monitor_id = any($1::uuid[])",
+    [ids],
+  );
+  await admin!.query(
+    "delete from public.check_results where monitor_id = any($1::uuid[])",
+    [ids],
+  );
+  await admin!.query(
+    "delete from public.monitor_state where monitor_id = any($1::uuid[])",
+    [ids],
+  );
+  await admin!.query(
+    "delete from public.monitor_schedules where monitor_id = any($1::uuid[]) and region = $2",
+    [ids, TEST_REGION_2],
+  );
+}
+
+type ResultPayload = {
+  status: string;
+  http_status: number | null;
+  response_time_ms: number;
+  dns_ms: number | null;
+  connect_ms: number | null;
+  tls_ms: number | null;
+  ttfb_ms: number | null;
+  total_ms: number;
+  error_class: string | null;
+  error_message: string | null;
+  redirect_count: number;
+  response_bytes: number | null;
+  checked_at: string;
+};
+
+function ingestPayload(
+  overrides: Partial<ResultPayload> = {},
+): ResultPayload {
+  return {
+    ...payload,
+    checked_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+async function ingestResult(
+  client: Client,
+  job: string,
+  token: string,
+  result: ResultPayload,
+): Promise<IngestResult> {
+  return jsonResult<IngestResult>(
+    client,
+    "select public.onedash_ingest_check_result($1, $2, $3::jsonb) as result",
+    [job, token, JSON.stringify(result)],
+  );
+}
+
 let admin: Client | null = null;
 let scheduler: Client | null = null;
 let scheduler2: Client | null = null;
 let queue: Client | null = null;
+let queue2: Client | null = null;
 let ingestor: Client | null = null;
+let ingestor2: Client | null = null;
 
 let originalSettings: ExecutionSettings | null = null;
 let savedSchedules: Array<{ id: string; next_run_at: Date }> = [];
@@ -178,16 +309,27 @@ beforeAll(async () => {
   scheduler = new Client({ connectionString: roleUrl("onedash_test_scheduler") });
   scheduler2 = new Client({ connectionString: roleUrl("onedash_test_scheduler") });
   queue = new Client({ connectionString: roleUrl("onedash_test_queue") });
+  queue2 = new Client({ connectionString: roleUrl("onedash_test_queue") });
   ingestor = new Client({ connectionString: roleUrl("onedash_test_ingestor") });
+  ingestor2 = new Client({ connectionString: roleUrl("onedash_test_ingestor") });
   await Promise.all([
     scheduler.connect(),
     scheduler2.connect(),
     queue.connect(),
+    queue2.connect(),
     ingestor.connect(),
+    ingestor2.connect(),
   ]);
 
   await admin.query("delete from public.monitors where id = any($1::uuid[])", [
-    [TEST_MONITOR_ID, TEST_MONITOR_ID_2, TEST_MONITOR_ID_3],
+    [
+      TEST_MONITOR_ID,
+      TEST_MONITOR_ID_2,
+      TEST_MONITOR_ID_3,
+      TEST_MONITOR_ID_4,
+      TEST_MONITOR_ID_5,
+      TEST_MONITOR_ID_6,
+    ],
   ]);
 
   const inserted = await admin.query(
@@ -204,12 +346,54 @@ beforeAll(async () => {
 
   await admin.query(
     `insert into public.monitor_execution_allowlist (
-       monitor_id, organization_id, reason
+       monitor_id, organization_id, url, reason
      )
-     select id, organization_id, 'phase4b integration test'
+     select id, organization_id, url, 'phase4b integration test'
      from public.monitors
      where id = $1`,
     [TEST_MONITOR_ID],
+  );
+
+  await admin.query(
+    `insert into public.monitors (
+       id, organization_id, name, url, method, expected_status_codes,
+       interval_seconds, timeout_seconds, is_active
+     )
+     select
+       v.id,
+       o.id,
+       v.name,
+       v.url,
+       'GET',
+       array[200],
+       300,
+       5,
+       true
+     from (
+       values
+         ($1::uuid, 'acme-monitoring', 'Concurrency fixture', $2),
+         ($3::uuid, 'globex-status', 'Second tenant fixture', $4),
+         ($5::uuid, 'acme-monitoring', 'Isolation control fixture', $6)
+     ) as v(id, org_slug, name, url)
+     join public.organizations o on o.slug = v.org_slug`,
+    [
+      TEST_MONITOR_ID_4,
+      `https://${TEST_HOST}/concurrency`,
+      TEST_MONITOR_ID_5,
+      `https://${TEST_HOST}/tenant`,
+      TEST_MONITOR_ID_6,
+      `https://${TEST_HOST}/control`,
+    ],
+  );
+
+  await admin.query(
+    `insert into public.monitor_execution_allowlist (
+       monitor_id, organization_id, url, reason
+     )
+     select id, organization_id, url, 'phase4b integration test'
+     from public.monitors
+     where id = any($1::uuid[])`,
+    [[TEST_MONITOR_ID_4, TEST_MONITOR_ID_5]],
   );
 
   await admin.query(
@@ -256,7 +440,9 @@ afterAll(async () => {
     scheduler?.end(),
     scheduler2?.end(),
     queue?.end(),
+    queue2?.end(),
     ingestor?.end(),
+    ingestor2?.end(),
   ]);
 
   if (admin) {
@@ -289,7 +475,16 @@ afterAll(async () => {
 
       await admin.query(
         "delete from public.monitors where id = any($1::uuid[])",
-        [[TEST_MONITOR_ID, TEST_MONITOR_ID_2, TEST_MONITOR_ID_3]],
+        [
+          [
+            TEST_MONITOR_ID,
+            TEST_MONITOR_ID_2,
+            TEST_MONITOR_ID_3,
+            TEST_MONITOR_ID_4,
+            TEST_MONITOR_ID_5,
+            TEST_MONITOR_ID_6,
+          ],
+        ],
       );
 
       await admin.query(
@@ -545,7 +740,7 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
       "select public.onedash_ingest_check_result($1, $2, $3::jsonb) as result",
       [jobId, "00000000-0000-4000-8000-000000000099", JSON.stringify(payload)],
     );
-    expect(wrongToken.duplicate).toBe(true);
+    expect(wrongToken).toMatchObject({ ok: false, reason: "lease_mismatch" });
   });
 
   it("retries with exponential backoff and dead-letters a terminal failure", async () => {
@@ -638,7 +833,10 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
       "select public.onedash_ingest_check_result($1, $2, $3::jsonb) as result",
       [job2Id, job2Token, JSON.stringify(payload)],
     );
-    expect(rejected).toMatchObject({ ok: false, reason: "lease_mismatch" });
+    expect(rejected).toMatchObject({
+      ok: false,
+      reason: "lease_mismatch_or_expired",
+    });
   });
 
   it("recovers an expired lease and dead-letters an exhausted job", async () => {
@@ -738,7 +936,10 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
       "select public.onedash_ingest_check_result($1, $2, $3::jsonb) as result",
       [job3Id, job3Token, JSON.stringify(payload)],
     );
-    expect(rejected).toMatchObject({ ok: false, reason: "lease_mismatch" });
+    expect(rejected).toMatchObject({
+      ok: false,
+      reason: "lease_mismatch_or_expired",
+    });
   });
 
   it("refuses scheduling and claiming when the execution gate is disabled or customer", async () => {
@@ -961,9 +1162,9 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
     );
     await admin!.query(
       `insert into public.monitor_execution_allowlist (
-         monitor_id, organization_id, reason
+         monitor_id, organization_id, url, reason
        )
-       select id, organization_id, 'phase4b worker runtime test'
+       select id, organization_id, url, 'phase4b worker runtime test'
        from public.monitors
        where id = $1`,
       [TEST_MONITOR_ID_3],
@@ -1070,5 +1271,570 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
     } finally {
       await Promise.allSettled([queueClient.close(), ingestorClient.close()]);
     }
+  });
+
+  it("claims two jobs concurrently without assigning a job to both workers", async () => {
+    await cleanupNewMonitors();
+    const jobA = await insertPendingJob(TEST_MONITOR_ID_4, "concurrent-claim-a");
+    const jobB = await insertPendingJob(TEST_MONITOR_ID_4, "concurrent-claim-b");
+
+    const [first, second] = await Promise.all([
+      claimFrom(queue!, "concurrent-worker-a", 1),
+      claimFrom(queue2!, "concurrent-worker-b", 1),
+    ]);
+
+    const claimedIds = [...first.jobs, ...second.jobs].map((job) => job.job_id);
+    expect(claimedIds.sort()).toEqual([jobA, jobB].sort());
+    expect(new Set(claimedIds).size).toBe(2);
+    expect(first.jobs).toHaveLength(1);
+    expect(second.jobs).toHaveLength(1);
+
+    const rows = await admin!.query(
+      `select id, status::text, lease_owner
+       from public.check_jobs
+       where id = any($1::uuid[])`,
+      [claimedIds],
+    );
+    expect(rows.rows).toHaveLength(2);
+    expect(rows.rows.every((row) => row.status === "leased")).toBe(true);
+    expect(new Set(rows.rows.map((row) => row.lease_owner)).size).toBe(2);
+  });
+
+  it("ingests concurrent results exactly once and treats a duplicate ingest as idempotent", async () => {
+    await cleanupNewMonitors();
+    const jobA = await insertPendingJob(TEST_MONITOR_ID_4, "concurrent-ingest-a");
+    const jobB = await insertPendingJob(TEST_MONITOR_ID_4, "concurrent-ingest-b");
+
+    const claim = await claimFrom(queue!, "concurrent-ingest-worker", 2);
+    expect(claim.jobs).toHaveLength(2);
+    const claimedA = claim.jobs.find((job) => job.job_id === jobA);
+    const claimedB = claim.jobs.find((job) => job.job_id === jobB);
+    expect(claimedA).toBeDefined();
+    expect(claimedB).toBeDefined();
+
+    const [resultA, resultB] = await Promise.all([
+      ingestResult(ingestor!, jobA, claimedA!.lease_token, ingestPayload()),
+      ingestResult(ingestor2!, jobB, claimedB!.lease_token, ingestPayload()),
+    ]);
+    expect(resultA).toMatchObject({ ok: true, duplicate: false });
+    expect(resultB).toMatchObject({ ok: true, duplicate: false });
+
+    const [duplicateA, duplicateB] = await Promise.all([
+      ingestResult(ingestor!, jobA, claimedA!.lease_token, ingestPayload()),
+      ingestResult(ingestor2!, jobB, claimedB!.lease_token, ingestPayload()),
+    ]);
+    expect(duplicateA).toMatchObject({ ok: true, duplicate: true });
+    expect(duplicateB).toMatchObject({ ok: true, duplicate: true });
+
+    const results = await admin!.query(
+      "select count(*)::int as count from public.check_results where monitor_id = $1",
+      [TEST_MONITOR_ID_4],
+    );
+    expect(results.rows[0].count).toBe(2);
+
+    const jobs = await admin!.query(
+      `select status::text, attempts
+       from public.check_jobs
+       where id = any($1::uuid[])`,
+      [[jobA, jobB]],
+    );
+    expect(jobs.rows).toHaveLength(2);
+    expect(
+      jobs.rows.every(
+        (row) => row.status === "completed" && row.attempts === 1,
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a stale worker after another worker reclaims the job", async () => {
+    await cleanupNewMonitors();
+    const id = await insertPendingJob(TEST_MONITOR_ID_4, "stale-worker");
+
+    const first = await claimFrom(queue!, "stale-worker-old", 1);
+    expect(first.jobs).toHaveLength(1);
+    const oldToken = first.jobs[0].lease_token;
+
+    await admin!.query(
+      "update public.check_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+      [id],
+    );
+    const reaped = await jsonResult<ReapResult>(
+      scheduler!,
+      "select public.onedash_reap_expired_leases($1) as result",
+      [10],
+    );
+    expect(reaped.recovered).toBeGreaterThanOrEqual(1);
+
+    await admin!.query(
+      "update public.check_jobs set available_at = now() where id = $1",
+      [id],
+    );
+    const second = await claimFrom(queue2!, "stale-worker-new", 1);
+    expect(second.jobs).toHaveLength(1);
+    expect(second.jobs[0]).toMatchObject({ job_id: id, attempts: 2 });
+    const newToken = second.jobs[0].lease_token;
+    expect(newToken).not.toBe(oldToken);
+
+    const stale = await ingestResult(
+      ingestor!,
+      id,
+      oldToken,
+      ingestPayload(),
+    );
+    expect(stale).toMatchObject({
+      ok: false,
+      reason: "lease_mismatch_or_expired",
+    });
+
+    const current = await ingestResult(
+      ingestor!,
+      id,
+      newToken,
+      ingestPayload(),
+    );
+    expect(current).toMatchObject({ ok: true, duplicate: false });
+
+    const results = await admin!.query(
+      "select count(*)::int as count from public.check_results where monitor_id = $1",
+      [TEST_MONITOR_ID_4],
+    );
+    expect(results.rows[0].count).toBe(1);
+  });
+
+  it("retries transient failures until attempts are exhausted", async () => {
+    await cleanupNewMonitors();
+    const id = await insertPendingJob(TEST_MONITOR_ID_4, "retry-exhaustion", {
+      maxAttempts: 5,
+    });
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      await admin!.query(
+        "update public.check_jobs set available_at = now() where id = $1",
+        [id],
+      );
+      const claim = await claimFrom(queue!, `retry-worker-${attempt}`, 1);
+      expect(claim.jobs).toHaveLength(1);
+      expect(claim.jobs[0]).toMatchObject({ job_id: id, attempts: attempt });
+
+      const failed = await jsonResult<FailResult>(
+        queue!,
+        "select public.onedash_fail_job($1, $2, $3, $4) as result",
+        [id, claim.jobs[0].lease_token, "worker_error", true],
+      );
+
+      if (attempt < 5) {
+        expect(failed).toMatchObject({ ok: true, status: "pending" });
+      } else {
+        expect(failed).toMatchObject({ ok: true, status: "dead_letter" });
+      }
+    }
+
+    const row = await admin!.query(
+      "select status::text, attempts, max_attempts, last_error_class from public.check_jobs where id = $1",
+      [id],
+    );
+    expect(row.rows[0]).toMatchObject({
+      status: "dead_letter",
+      attempts: 5,
+      max_attempts: 5,
+      last_error_class: "worker_error",
+    });
+  });
+
+  it("dead-letters a blocked target immediately without a retry", async () => {
+    await cleanupNewMonitors();
+    const id = await insertPendingJob(TEST_MONITOR_ID_4, "blocked-target");
+
+    const claim = await claimFrom(queue!, "blocked-target-worker", 1);
+    expect(claim.jobs).toHaveLength(1);
+    const failed = await jsonResult<FailResult>(
+      queue!,
+      "select public.onedash_fail_job($1, $2, $3, $4) as result",
+      [id, claim.jobs[0].lease_token, "blocked_target", false],
+    );
+    expect(failed).toMatchObject({ ok: true, status: "dead_letter" });
+
+    const row = await admin!.query(
+      "select status::text, attempts, last_error_class from public.check_jobs where id = $1",
+      [id],
+    );
+    expect(row.rows[0]).toMatchObject({
+      status: "dead_letter",
+      attempts: 1,
+      last_error_class: "blocked_target",
+    });
+  });
+
+  it("keeps a second tenant's result and monitor state isolated", async () => {
+    await cleanupNewMonitors();
+    const id = await insertPendingJob(TEST_MONITOR_ID_5, "tenant-isolation");
+
+    const claim = await claimFrom(queue!, "tenant-worker", 1);
+    expect(claim.jobs).toHaveLength(1);
+    const ingested = await ingestResult(
+      ingestor!,
+      id,
+      claim.jobs[0].lease_token,
+      ingestPayload(),
+    );
+    expect(ingested).toMatchObject({ ok: true, duplicate: false });
+
+    const globex = await admin!.query(
+      "select id from public.organizations where slug = 'globex-status'",
+    );
+    const result = await admin!.query(
+      "select organization_id, status::text from public.check_results where monitor_id = $1",
+      [TEST_MONITOR_ID_5],
+    );
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      organization_id: globex.rows[0].id,
+      status: "up",
+    });
+
+    const state = await admin!.query(
+      "select organization_id, status::text from public.monitor_state where monitor_id = $1",
+      [TEST_MONITOR_ID_5],
+    );
+    expect(state.rows).toHaveLength(1);
+    expect(state.rows[0]).toMatchObject({
+      organization_id: globex.rows[0].id,
+      status: "up",
+    });
+
+    const control = await admin!.query(
+      `select
+         (select count(*)::int from public.check_results where monitor_id = $1) as results,
+         (select count(*)::int from public.monitor_state where monitor_id = $1) as states,
+         (select count(*)::int from public.check_results where monitor_id = $2) as other_results`,
+      [TEST_MONITOR_ID_6, TEST_MONITOR_ID_4],
+    );
+    expect(control.rows[0]).toEqual({
+      results: 0,
+      states: 0,
+      other_results: 0,
+    });
+  });
+
+  it("validates acknowledgement ownership for completed and in-flight jobs", async () => {
+    await cleanupNewMonitors();
+    const id = await insertPendingJob(TEST_MONITOR_ID_4, "acknowledgement");
+
+    const claim = await claimFrom(queue!, "ack-worker", 1);
+    expect(claim.jobs).toHaveLength(1);
+    const token = claim.jobs[0].lease_token;
+
+    const beforeIngest = await jsonResult<AckResult>(
+      ingestor!,
+      "select public.onedash_acknowledge_job($1, $2) as result",
+      [id, token],
+    );
+    expect(beforeIngest).toMatchObject({
+      ok: false,
+      reason: "result_not_found",
+    });
+
+    const ingested = await ingestResult(
+      ingestor!,
+      id,
+      token,
+      ingestPayload(),
+    );
+    expect(ingested).toMatchObject({ ok: true, duplicate: false });
+
+    const acknowledged = await jsonResult<AckResult>(
+      ingestor!,
+      "select public.onedash_acknowledge_job($1, $2) as result",
+      [id, token],
+    );
+    expect(acknowledged).toMatchObject({
+      ok: true,
+      duplicate: true,
+      job_status: "completed",
+    });
+
+    const wrongToken = await jsonResult<AckResult>(
+      ingestor!,
+      "select public.onedash_acknowledge_job($1, $2) as result",
+      [id, "00000000-0000-4000-8000-000000000099"],
+    );
+    expect(wrongToken).toMatchObject({ ok: false, reason: "lease_mismatch" });
+  });
+
+  it("requires a live lease for release and failure", async () => {
+    await cleanupNewMonitors();
+    const id = await insertPendingJob(TEST_MONITOR_ID_4, "expired-release");
+
+    const claim = await claimFrom(queue!, "expired-release-worker", 1);
+    expect(claim.jobs).toHaveLength(1);
+    const token = claim.jobs[0].lease_token;
+
+    await admin!.query(
+      "update public.check_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+      [id],
+    );
+
+    const failed = await jsonResult<FailResult>(
+      queue!,
+      "select public.onedash_fail_job($1, $2, $3, $4) as result",
+      [id, token, "worker_error", true],
+    );
+    expect(failed).toMatchObject({
+      ok: false,
+      reason: "lease_mismatch_or_expired",
+    });
+
+    const released = await jsonResult<ReleaseResult>(
+      queue!,
+      "select public.onedash_release_job($1, $2) as result",
+      [id, token],
+    );
+    expect(released).toMatchObject({
+      ok: false,
+      reason: "lease_mismatch_or_expired",
+    });
+
+    const stillLeased = await admin!.query(
+      "select status::text, lease_token from public.check_jobs where id = $1",
+      [id],
+    );
+    expect(stillLeased.rows[0]).toMatchObject({
+      status: "leased",
+      lease_token: token,
+    });
+
+    const reaped = await jsonResult<ReapResult>(
+      scheduler!,
+      "select public.onedash_reap_expired_leases($1) as result",
+      [10],
+    );
+    expect(reaped.recovered).toBeGreaterThanOrEqual(1);
+
+    const recovered = await admin!.query(
+      "select status::text, lease_token, lease_expires_at from public.check_jobs where id = $1",
+      [id],
+    );
+    expect(recovered.rows[0]).toMatchObject({
+      status: "pending",
+      lease_token: null,
+      lease_expires_at: null,
+    });
+  });
+
+  it("validates ingested status codes and the safe error-message vocabulary", async () => {
+    await cleanupNewMonitors();
+    const id = await insertPendingJob(TEST_MONITOR_ID_4, "status-validation");
+
+    const claim = await claimFrom(queue!, "status-worker", 1);
+    expect(claim.jobs).toHaveLength(1);
+    const token = claim.jobs[0].lease_token;
+
+    await expectPgError(
+      ingestor!.query(
+        "select public.onedash_ingest_check_result($1, $2, $3::jsonb)",
+        [id, token, JSON.stringify(ingestPayload({ http_status: 500 }))],
+      ),
+      "22023",
+    );
+
+    await expectPgError(
+      ingestor!.query(
+        "select public.onedash_ingest_check_result($1, $2, $3::jsonb)",
+        [
+          id,
+          token,
+          JSON.stringify(
+            ingestPayload({
+              status: "down",
+              http_status: 200,
+              error_class: "http_status_mismatch",
+              error_message: SAFE_MESSAGES.http_status_mismatch,
+            }),
+          ),
+        ],
+      ),
+      "22023",
+    );
+
+    await expectPgError(
+      ingestor!.query(
+        "select public.onedash_ingest_check_result($1, $2, $3::jsonb)",
+        [
+          id,
+          token,
+          JSON.stringify(
+            ingestPayload({
+              status: "down",
+              http_status: 500,
+              error_class: "timeout",
+              error_message: "timeout at https://customer.example/private",
+            }),
+          ),
+        ],
+      ),
+      "22023",
+    );
+
+    const valid = await ingestResult(
+      ingestor!,
+      id,
+      token,
+      ingestPayload({
+        status: "down",
+        http_status: 500,
+        error_class: "http_status_mismatch",
+        error_message: SAFE_MESSAGES.http_status_mismatch,
+      }),
+    );
+    expect(valid).toMatchObject({ ok: true, monitor_status: "down" });
+
+    const result = await admin!.query(
+      "select status::text, http_status, error_class, error_message from public.check_results where monitor_id = $1",
+      [TEST_MONITOR_ID_4],
+    );
+    expect(result.rows[0]).toMatchObject({
+      status: "down",
+      http_status: 500,
+      error_class: "http_status_mismatch",
+      error_message: SAFE_MESSAGES.http_status_mismatch,
+    });
+  });
+
+  it("refuses a real due schedule and pending job when the execution gate is disabled or customer", async () => {
+    await cleanupNewMonitors();
+    await admin!.query(
+      `insert into public.monitor_schedules (
+         organization_id, monitor_id, region, next_run_at
+       )
+       select organization_id, id, $2, now() - interval '1 minute'
+       from public.monitors
+       where id = $1`,
+      [TEST_MONITOR_ID_4, TEST_REGION_2],
+    );
+    const id = await insertPendingJob(TEST_MONITOR_ID_4, "customer-gate");
+
+    await admin!.query(
+      `update public.monitor_execution_settings
+       set mode = 'disabled',
+           execution_enabled = false,
+           reason = 'customer gate test disabled',
+           egress_verified_at = null,
+           egress_verified_by = null
+       where singleton`,
+    );
+
+    const disabledSchedule = await jsonResult<ScheduleResult>(
+      scheduler!,
+      "select public.onedash_schedule_due_jobs($1, $2) as result",
+      [10, 0],
+    );
+    expect(disabledSchedule).toMatchObject({
+      scheduled: 0,
+      execution_mode: "disabled",
+    });
+    const disabledClaim = await claimFrom(queue!, "customer-gate-disabled", 5);
+    expect(disabledClaim.jobs).toHaveLength(0);
+
+    const pendingWhileDisabled = await admin!.query(
+      "select count(*)::int as count from public.check_jobs where id = $1 and status = 'pending'",
+      [id],
+    );
+    expect(pendingWhileDisabled.rows[0].count).toBe(1);
+
+    await admin!.query(
+      `update public.monitor_execution_settings
+       set mode = 'customer',
+           execution_enabled = true,
+           reason = 'customer gate test customer',
+           egress_verified_at = now(),
+           egress_verified_by = 'phase4b integration test'
+       where singleton`,
+    );
+
+    const customerSchedule = await jsonResult<ScheduleResult>(
+      scheduler!,
+      "select public.onedash_schedule_due_jobs($1, $2) as result",
+      [10, 0],
+    );
+    expect(customerSchedule).toMatchObject({
+      scheduled: 0,
+      execution_mode: "customer",
+    });
+    const customerClaim = await claimFrom(queue!, "customer-gate-customer", 5);
+    expect(customerClaim.jobs).toHaveLength(0);
+
+    const pendingWhileCustomer = await admin!.query(
+      "select count(*)::int as count from public.check_jobs where id = $1 and status = 'pending'",
+      [id],
+    );
+    expect(pendingWhileCustomer.rows[0].count).toBe(1);
+
+    await admin!.query(
+      `update public.monitor_execution_settings
+       set mode = 'fixtures',
+           execution_enabled = true,
+           reason = 'phase4b integration test',
+           egress_verified_at = null,
+           egress_verified_by = null
+       where singleton`,
+    );
+  });
+
+  it("records strict heartbeats and cleans up stale heartbeat rows", async () => {
+    const instanceId = "phase4b-cleanup-heartbeat";
+    await scheduler!.query(
+      "select public.onedash_record_heartbeat($1, $2, $3, $4::jsonb)",
+      [
+        "scheduler",
+        instanceId,
+        "global",
+        JSON.stringify({
+          batch_size: 10,
+          jitter_seconds: 0,
+          last_scheduled: 0,
+          last_skipped: 0,
+          execution_mode: "fixtures",
+        }),
+      ],
+    );
+
+    await expectPgError(
+      queue!.query(
+        "select public.onedash_record_heartbeat($1, $2, $3, $4::jsonb)",
+        [
+          "worker",
+          "phase4b-nested-heartbeat",
+          TEST_REGION,
+          JSON.stringify({
+            concurrency: 2,
+            in_flight: 0,
+            claimed_total: 0,
+            completed_total: 0,
+            failed_total: 0,
+            retried_total: 0,
+            last_error_class: null,
+            details: { url: "https://customer.example/private" },
+          }),
+        ],
+      ),
+      "22023",
+    );
+
+    await admin!.query(
+      "update public.service_heartbeats set last_seen_at = now() - interval '2 days' where component = 'scheduler' and instance_id = $1",
+      [instanceId],
+    );
+
+    const cleanup = await scheduler!.query(
+      "select public.onedash_cleanup_stale_heartbeats($1) as count",
+      [86400],
+    );
+    expect(cleanup.rows[0].count).toBeGreaterThanOrEqual(1);
+
+    const remaining = await admin!.query(
+      "select count(*)::int as count from public.service_heartbeats where instance_id = $1",
+      [instanceId],
+    );
+    expect(remaining.rows[0].count).toBe(0);
   });
 });
