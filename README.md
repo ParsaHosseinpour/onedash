@@ -148,7 +148,7 @@ historical waitlist file; it is retained for reference and must not be applied
 after the migrations. The waitlist migration intentionally changes its grants
 to close the direct anon PostgREST INSERT bypass.
 
-The current suite has **276 pgTAP assertions** across eight files:
+The current suite has **335 pgTAP assertions** across nine files:
 
 - `001_schema_invariants.sql` — RLS coverage, indexes, constraints, function
   hardening, default privilege removal, and waitlist privileges.
@@ -170,6 +170,10 @@ The current suite has **276 pgTAP assertions** across eight files:
 - `008_phase4b_queue_permissions.sql` - Phase 4B role separation, split function
   grants, legacy-worker denial, execution-gate defaults, queue constraints, and
   restricted-role smoke checks.
+- `009_phase4b_security_hardening.sql` - Phase 4B.2 function ownership,
+  `PUBLIC` execute denial, empty `search_path`, URL-bound fixture authorization,
+  strict heartbeat/result validation, and `service_role` non-DML denial across
+  all ten internal tables.
 
 The tests run against the seeded local database. They create their own users
 and organizations inside a transaction and roll back, and they scope assertions
@@ -260,7 +264,8 @@ Phase 4B adds the data-plane foundation without activating customer monitoring:
 - **Scheduler:** a standalone Node loop in `worker/scheduler/` that processes
   only active, due, operator-allowlisted fixture monitors, uses row locks and
   deterministic per-slot jitter, advances `next_run_at` safely, skips missed
-  downtime slots instead of creating a backlog, and records heartbeats/metrics.
+  downtime slots instead of creating a backlog, runs stale-heartbeat cleanup at
+  most once per hour, and records heartbeats/metrics.
 - **Worker:** a separate Node service in `worker/service/` with bounded
   concurrency, lease extension, graceful shutdown, `/healthz`, `/readyz`, and
   `/metrics`. It reuses the Phase 4A checker through `worker/checker/adapter.ts`.
@@ -500,24 +505,24 @@ are included in the push filter.
 
 ## Verification status
 
-Verified locally on 2026-11-04:
+Verified locally on 2026-11-09:
 
 | Check | Result |
 | --- | --- |
-| `npm run lint` | Pass, no findings |
+| `npm run lint` | Pass; one warning in the untracked `.opencode/graphify.js` environment plugin, no app-code findings |
 | `npm run typecheck` | Pass |
-| `npm test` | 390 tests across 32 files pass |
+| `npm test` | 431 tests across 33 files pass |
 | `npm run test:checker` | 160 checker tests across 7 files pass |
-| `npm run test:worker` | 59 worker/scheduler tests across 7 files pass |
-| `npm run test:scheduler` | 5 scheduler tests across 1 file pass |
-| `npm run test:phase4b` | 9 database pipeline tests pass using four restricted-role connections |
-| `npm run build` (no Supabase env) | Pass |
+| `npm run test:worker` | 100 worker/scheduler tests across 8 files pass |
+| `npm run test:scheduler` | 7 scheduler tests across 1 file pass |
+| `npm run test:phase4b` | 20 database pipeline tests pass using four restricted-role connections |
+| `npm run build` | Pass |
 | `npm run worker:build` | Pass |
 | `npm audit --omit=dev` | 0 vulnerabilities |
-| `npm run db:reset` | 9 migrations + seed pass |
-| `npm run db:test` | 276 assertions across 8 files pass |
+| `npm run db:reset` | 11 migrations + seed pass |
+| `npm run db:test` | 335 assertions across 9 files pass |
 | `npm run db:lint` | No schema errors |
-| Phase 4A preflight (read-only, local) | 3 monitors, 0 blocking, 0 unexpected error classes |
+| Phase 4B.2 catalog checks (read-only, local) | `service_role` non-DML privileges false on all ten tables; all 17 Phase 4B `SECURITY DEFINER` functions owned by `onedash_function_owner` |
 
 Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite. Phase 4A.1 checker coverage is application-level plus local TLS; it does not prove production TLS against a publicly trusted CA or deployment egress isolation, which remain release gates. Phase 4B coverage proves the local fixtures pipeline and permission split; it does not prove customer execution, multi-region behavior, or hosted egress isolation.
 

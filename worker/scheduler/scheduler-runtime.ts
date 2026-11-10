@@ -16,6 +16,7 @@ import type { ScheduleSummary } from "./scheduler-client";
 export interface SchedulerClientLike {
   scheduleDueJobs(batchSize: number, jitterSeconds: number): Promise<ScheduleSummary>;
   reapExpiredLeases(limit: number): Promise<ReapResult>;
+  cleanupStaleHeartbeats(olderThanSeconds: number): Promise<number>;
   recordHeartbeat(
     component: "scheduler" | "worker",
     instanceId: string,
@@ -44,13 +45,28 @@ export type SchedulerRuntimeMetrics = {
   skippedTotal: number;
   reapedTotal: number;
   deadLetteredTotal: number;
+  staleHeartbeatsDeletedTotal: number;
   lastTickAt: string | null;
   lastHeartbeatAt: string | null;
+  lastHeartbeatCleanupAt: string | null;
   lastErrorClass: string | null;
 };
 
 const REAP_BATCH = 20;
 const SHUTDOWN_GRACE_MS = 5000;
+
+/**
+ * Heartbeat rows are retained for one day. This matches the database
+ * function's default and is far longer than an active scheduler or worker
+ * heartbeat interval, so live services are never selected for deletion.
+ */
+export const STALE_HEARTBEAT_RETENTION_SECONDS = 86400;
+
+/**
+ * Run the cleanup at most once per hour. A scheduler tick is usually seconds
+ * apart; cleanup is maintenance, not part of the execution path.
+ */
+export const STALE_HEARTBEAT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
 export class SchedulerRuntime {
   private readonly config: SchedulerConfig;
@@ -67,6 +83,8 @@ export class SchedulerRuntime {
   private lastLoggedExecutionMode: string | null = null;
   private lastTickAt: string | null = null;
   private lastHeartbeatAt: string | null = null;
+  private lastHeartbeatCleanupAtMs: number | null = null;
+  private lastHeartbeatCleanupAt: string | null = null;
   private lastErrorClass: string | null = null;
 
   private ticks = 0;
@@ -74,6 +92,7 @@ export class SchedulerRuntime {
   private skippedTotal = 0;
   private reapedTotal = 0;
   private deadLetteredTotal = 0;
+  private staleHeartbeatsDeletedTotal = 0;
 
   constructor(options: SchedulerRuntimeOptions) {
     this.config = options.config;
@@ -120,8 +139,10 @@ export class SchedulerRuntime {
       skippedTotal: this.skippedTotal,
       reapedTotal: this.reapedTotal,
       deadLetteredTotal: this.deadLetteredTotal,
+      staleHeartbeatsDeletedTotal: this.staleHeartbeatsDeletedTotal,
       lastTickAt: this.lastTickAt,
       lastHeartbeatAt: this.lastHeartbeatAt,
+      lastHeartbeatCleanupAt: this.lastHeartbeatCleanupAt,
       lastErrorClass: this.lastErrorClass,
     };
   }
@@ -129,12 +150,21 @@ export class SchedulerRuntime {
   async runOnce(): Promise<void> {
     if (this.stopping) return;
 
+    const tickStartedAtMs = this.now();
     const status = await this.client.getExecutionStatus();
     this.lastDbExecutionMode = status.mode;
 
     if (status.mode !== this.lastLoggedExecutionMode) {
       this.logger.info("execution_mode_observed", { mode: status.mode });
       this.lastLoggedExecutionMode = status.mode;
+    }
+
+    if (
+      this.lastHeartbeatCleanupAtMs === null ||
+      tickStartedAtMs - this.lastHeartbeatCleanupAtMs >=
+        STALE_HEARTBEAT_CLEANUP_INTERVAL_MS
+    ) {
+      await this.cleanupStaleHeartbeats(tickStartedAtMs);
     }
 
     const reap = await this.client.reapExpiredLeases(REAP_BATCH);
@@ -173,6 +203,31 @@ export class SchedulerRuntime {
       deadLettered: reap.deadLettered,
       mode: status.mode,
     });
+  }
+
+  private async cleanupStaleHeartbeats(nowMs: number): Promise<void> {
+    // Record the attempt even when it fails so a persistent database error
+    // cannot turn cleanup into a per-tick retry storm.
+    this.lastHeartbeatCleanupAtMs = nowMs;
+    try {
+      const deleted = await this.client.cleanupStaleHeartbeats(
+        STALE_HEARTBEAT_RETENTION_SECONDS,
+      );
+      this.staleHeartbeatsDeletedTotal += deleted;
+      this.lastHeartbeatCleanupAt = new Date(nowMs).toISOString();
+      if (deleted > 0) {
+        this.logger.info("heartbeat_cleanup", { deleted });
+      }
+    } catch (error) {
+      // Cleanup is maintenance. A failure must not skip reaping, scheduling,
+      // or the heartbeat for this tick.
+      const classified = classifyError(error);
+      this.lastErrorClass = classified.errorClass;
+      this.logger.error("heartbeat_cleanup_failed", {
+        errorClass: classified.errorClass,
+        errorCode: classified.errorCode,
+      });
+    }
   }
 
   private async loop(): Promise<void> {

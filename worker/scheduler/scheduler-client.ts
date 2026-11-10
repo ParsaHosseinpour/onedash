@@ -93,6 +93,14 @@ export class SchedulerClient {
     return parseReapResult(value);
   }
 
+  async cleanupStaleHeartbeats(olderThanSeconds: number): Promise<number> {
+    const value = await this.queryResult(
+      "select public.onedash_cleanup_stale_heartbeats($1) as result",
+      [olderThanSeconds],
+    );
+    return asNumber(value, "stale_heartbeats_deleted");
+  }
+
   async recordHeartbeat(
     component: "scheduler" | "worker",
     instanceId: string,

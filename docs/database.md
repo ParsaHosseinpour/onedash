@@ -9,10 +9,10 @@ schema has been deployed to a hosted Supabase project.
 
 ## Status
 
-- Nine versioned migrations live in `supabase/migrations/`.
+- Eleven versioned migrations live in `supabase/migrations/`.
 - `supabase db reset` applies all migrations and `supabase/seed.sql` from an
   empty local database.
-- `supabase test db --local` runs 276 pgTAP assertions across eight files; all
+- `supabase test db --local` runs 335 pgTAP assertions across nine files; all
   pass on a fresh reset.
 - `supabase db lint --local` reports no schema errors.
 - `supabase/schema.sql` is retained as the Phase 1 historical file. The
@@ -110,6 +110,15 @@ channels, encrypted placeholder secrets, and an alert delivery.
    `onedash_scheduler`/`onedash_queue`/`onedash_ingestor` roles, restricted
    scheduler/queue/ingestor functions, and removal of the legacy
    `onedash_worker` grants and policies.
+10. `20261104090000_phase4b_security_hardening.sql` - Phase 4B function-owner
+    separation, bounded region registry, URL-bound fixture authorization,
+    strict heartbeat/result validation, queue completion ownership tokens, and
+    removal of non-DML privileges from `service_role` on the five newer Phase 4B
+    tables.
+11. `20261105090000_phase4b_final_security_hardening.sql` - extends the
+    `service_role` non-DML revocation (`TRUNCATE`, `REFERENCES`, `TRIGGER`, and
+    PostgreSQL 17+ `MAINTAIN`) to all ten internal tables and transfers the two
+    remaining reporting functions to the dedicated function owner.
 
 ## Entity relationship diagram
 
@@ -533,9 +542,13 @@ misconfigured.
 `worker/scheduler/` runs a long-lived loop. Each tick:
 
 1. Reads the execution gate and logs mode changes.
-2. Reaps a bounded batch of expired leases.
-3. Calls `onedash_schedule_due_jobs(batch_size, jitter_seconds)`.
-4. Records a sanitized scheduler heartbeat.
+2. At most once per hour, deletes heartbeat rows older than 24 hours through
+   `onedash_cleanup_stale_heartbeats(86400)`. The retention is far longer than
+   an active scheduler/worker heartbeat interval, so live rows are never
+   selected. A cleanup failure is logged and does not skip the rest of the tick.
+3. Reaps a bounded batch of expired leases.
+4. Calls `onedash_schedule_due_jobs(batch_size, jitter_seconds)`.
+5. Records a sanitized scheduler heartbeat.
 
 The scheduling function locks due schedule rows with
 `FOR UPDATE OF s SKIP LOCKED`, so multiple scheduler instances are safe. It
@@ -599,6 +612,21 @@ privileges**; they only execute the restricted functions listed in the role
 matrix. The legacy `onedash_worker` role has no direct table, sequence, function,
 schema, or policy grants. `PUBLIC` retains `USAGE` on schema `public`, so the
 role can see schema object names, but it has no data access.
+
+Only administrative privileges are revoked; the migration does not alter any
+DML grant. In the current schema `service_role` has no direct table privilege on
+the ten internal tables (`check_jobs`, `service_heartbeats`,
+`monitor_execution_settings`, `monitor_execution_allowlist`,
+`supported_regions`, `check_results`, `monitor_state`, `monitor_schedules`,
+`monitors`, and `monitor_request_secrets`): user-facing monitor/result access is
+through `authenticated` RLS policies, and scheduler/queue/ingestor access is
+through the restricted functions. `service_role` specifically has no
+`TRUNCATE`, `REFERENCES`, `TRIGGER`, or PostgreSQL 17+ `MAINTAIN` privilege on
+any of the ten tables, so it cannot bypass RLS with a full-table truncate,
+create constraints/triggers, or run physical maintenance. All Phase 4B
+`SECURITY DEFINER` functions are owned by the NOLOGIN NOINHERIT
+`onedash_function_owner` role, have an empty `search_path`, and deny `PUBLIC`
+execute.
 
 The checker module has no database client, no service-role key, and no direct
 private-data access. The worker process holds the restricted queue and ingestor
@@ -676,8 +704,12 @@ The pgTAP suite is in `supabase/tests/database/`:
 - `008_phase4b_queue_permissions.sql` - Phase 4B role separation, split function
   grants, legacy-worker denial, execution-gate defaults, queue constraints, RLS
   with no policies, and restricted-role execution smoke checks.
+- `009_phase4b_security_hardening.sql` - Phase 4B.2 function ownership,
+  `PUBLIC` execute denial, empty `search_path`, URL-bound fixture
+  authorization, strict heartbeat/result validation, and `service_role` non-DML
+  denial across all ten internal tables.
 
-The suite currently has **276 assertions across eight files**.
+The suite currently has **335 assertions across nine files**.
 
 Phase 4B also has a separate multi-connection integration test:
 `tests/phase4b/database-pipeline.test.ts`. It is not part of the default

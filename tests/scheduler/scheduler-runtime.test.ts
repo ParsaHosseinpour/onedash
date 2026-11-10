@@ -10,6 +10,8 @@ import type {
 import type { ScheduleSummary } from "../../worker/scheduler/scheduler-client";
 import {
   SchedulerRuntime,
+  STALE_HEARTBEAT_CLEANUP_INTERVAL_MS,
+  STALE_HEARTBEAT_RETENTION_SECONDS,
   type SchedulerClientLike,
 } from "../../worker/scheduler/scheduler-runtime";
 
@@ -68,6 +70,10 @@ class FakeSchedulerClient implements SchedulerClientLike {
   statusCalls = 0;
   scheduleCalls = 0;
   reapCalls = 0;
+  cleanupCalls = 0;
+  cleanupRetention: number[] = [];
+  cleanupResult = 3;
+  cleanupError: Error | null = null;
   heartbeats: Array<{
     component: "scheduler" | "worker";
     instanceId: string;
@@ -90,6 +96,13 @@ class FakeSchedulerClient implements SchedulerClientLike {
   async reapExpiredLeases(): Promise<ReapResult> {
     this.reapCalls += 1;
     return this.reapResult;
+  }
+
+  async cleanupStaleHeartbeats(olderThanSeconds: number): Promise<number> {
+    this.cleanupCalls += 1;
+    this.cleanupRetention.push(olderThanSeconds);
+    if (this.cleanupError) throw this.cleanupError;
+    return this.cleanupResult;
   }
 
   async recordHeartbeat(
@@ -130,6 +143,10 @@ describe("SchedulerRuntime", () => {
     expect(client.statusCalls).toBe(1);
     expect(client.reapCalls).toBe(1);
     expect(client.scheduleCalls).toBe(1);
+    expect(client.cleanupCalls).toBe(1);
+    expect(client.cleanupRetention).toEqual([
+      STALE_HEARTBEAT_RETENTION_SECONDS,
+    ]);
     expect(client.lastBatchSize).toBe(50);
     expect(client.lastJitterSeconds).toBe(10);
     expect(client.heartbeats).toHaveLength(1);
@@ -152,10 +169,60 @@ describe("SchedulerRuntime", () => {
       skippedTotal: 1,
       reapedTotal: 1,
       deadLetteredTotal: 0,
+      staleHeartbeatsDeletedTotal: 3,
       lastTickAt: "2026-01-02T03:04:05.000Z",
       lastHeartbeatAt: "2026-01-02T03:04:05.000Z",
+      lastHeartbeatCleanupAt: "2026-01-02T03:04:05.000Z",
       lastErrorClass: null,
     });
+  });
+
+  it("runs stale-heartbeat cleanup on a bounded interval, not every tick", async () => {
+    let nowMs = Date.parse("2026-01-02T03:04:05.000Z");
+    const client = new FakeSchedulerClient();
+    const runtime = new SchedulerRuntime({
+      config: config(),
+      client,
+      logger: createSilentLogger(),
+      now: () => nowMs,
+    });
+
+    await runtime.runOnce();
+    expect(client.cleanupCalls).toBe(1);
+
+    nowMs += STALE_HEARTBEAT_CLEANUP_INTERVAL_MS - 1;
+    await runtime.runOnce();
+    expect(client.cleanupCalls).toBe(1);
+
+    nowMs += 1;
+    await runtime.runOnce();
+    expect(client.cleanupCalls).toBe(2);
+    expect(client.cleanupRetention).toEqual([
+      STALE_HEARTBEAT_RETENTION_SECONDS,
+      STALE_HEARTBEAT_RETENTION_SECONDS,
+    ]);
+    expect(runtime.getMetrics().staleHeartbeatsDeletedTotal).toBe(6);
+  });
+
+  it("keeps scheduling and heartbeating when heartbeat cleanup fails", async () => {
+    const client = new FakeSchedulerClient();
+    client.cleanupError = new Error("cleanup database unavailable");
+    const runtime = new SchedulerRuntime({
+      config: config(),
+      client,
+      logger: createSilentLogger(),
+      now: () => Date.parse("2026-01-02T03:04:05.000Z"),
+    });
+
+    await expect(runtime.runOnce()).resolves.toBeUndefined();
+
+    expect(client.cleanupCalls).toBe(1);
+    expect(client.reapCalls).toBe(1);
+    expect(client.scheduleCalls).toBe(1);
+    expect(client.heartbeats).toHaveLength(1);
+    expect(runtime.getMetrics().staleHeartbeatsDeletedTotal).toBe(0);
+    expect(runtime.getMetrics().lastHeartbeatCleanupAt).toBeNull();
+    expect(runtime.getMetrics().lastErrorClass).not.toBeNull();
   });
 
   it("still heartbeats while the execution gate is disabled", async () => {

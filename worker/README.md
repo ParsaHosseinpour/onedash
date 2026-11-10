@@ -35,8 +35,8 @@ seams are rejected unless `NODE_ENV=test`.
 | `service/worker-runtime.ts` | Bounded concurrency, lease extension, retries, shutdown, and runtime metrics. |
 | `service/health-server.ts` | `/healthz`, `/readyz`, and `/metrics` HTTP endpoints. |
 | `service/main.ts` | Worker process entry point and graceful signal handling. |
-| `scheduler/scheduler-client.ts` | Restricted scheduler RPC client. |
-| `scheduler/scheduler-runtime.ts` | Scheduler loop, lease reaping, heartbeat, and metrics. |
+| `scheduler/scheduler-client.ts` | Restricted scheduler RPC client, including bounded stale-heartbeat cleanup. |
+| `scheduler/scheduler-runtime.ts` | Scheduler loop, lease reaping, hourly heartbeat cleanup, heartbeat, and metrics. |
 | `scheduler/main.ts` | Scheduler process entry point and graceful signal handling. |
 
 Tests live in `tests/checker/` and run with:
@@ -100,6 +100,21 @@ npm run worker:start:scheduler
 not automatically load `.env.local`. Export the variables in the shell or use a
 process manager. Never commit connection strings or metrics tokens.
 
+### Scheduler heartbeat cleanup
+
+The scheduler calls `onedash_cleanup_stale_heartbeats(86400)` at most once per
+hour. The function deletes heartbeat rows whose `last_seen_at` is older than 24
+hours, which is far longer than the normal scheduler/worker heartbeat interval,
+so active services are never deleted. The scheduler uses its existing
+least-privileged `onedash_scheduler` connection; no extra role or service is
+introduced.
+
+A cleanup failure is logged as `heartbeat_cleanup_failed` and recorded in the
+last-error metric, but it does not skip lease reaping, scheduling, or the
+scheduler heartbeat for that tick. The next attempt is delayed until the next
+hourly window so a database problem cannot cause a per-tick retry storm. Scheduler
+metrics expose `staleHeartbeatsDeletedTotal` and `lastHeartbeatCleanupAt`.
+
 ### Environment
 
 | Variable | Default | Notes |
@@ -147,8 +162,9 @@ loopback. Keep the health server on a private network.
 Runtime metrics include claimed/completed/failed/retried/released/reaped jobs,
 timeouts, check-duration count/sum/max, in-flight/concurrency, last claim and
 heartbeat times, and the last sanitized error class. Scheduler metrics include
-ticks, scheduled/skipped totals, reaped/dead-lettered totals, and the last tick
-and heartbeat. Queue metrics include depth, oldest pending age, leased count,
+ticks, scheduled/skipped totals, reaped/dead-lettered totals, stale heartbeats
+deleted, the last cleanup and heartbeat times, and the last sanitized error
+class. Queue metrics include depth, oldest pending age, leased count,
 expired-lease count, and completed/failed/retried counters.
 
 ### Queue and ingestion behavior

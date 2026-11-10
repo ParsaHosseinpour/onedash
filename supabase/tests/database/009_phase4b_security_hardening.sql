@@ -34,6 +34,12 @@ select is(
 );
 
 select is(
+  (select rolinherit from pg_roles where rolname = 'onedash_function_owner'),
+  false,
+  'function owner is NOINHERIT'
+);
+
+select is(
   (
     select count(*)::int
     from pg_auth_members m
@@ -58,20 +64,124 @@ select is(
     from pg_proc
     where pronamespace = 'public'::regnamespace
       and proname in (
-        'onedash_schedule_due_jobs',
-        'onedash_claim_jobs',
-        'onedash_extend_lease',
-        'onedash_release_job',
-        'onedash_fail_job',
-        'onedash_reap_expired_leases',
         'onedash_acknowledge_job',
+        'onedash_allowlist_revocation',
+        'onedash_bind_allowlist_url',
+        'onedash_claim_jobs',
+        'onedash_cleanup_stale_heartbeats',
+        'onedash_dead_letter_monitor_jobs',
+        'onedash_execution_status',
+        'onedash_extend_lease',
+        'onedash_fail_job',
         'onedash_ingest_check_result',
-        'onedash_record_heartbeat'
+        'onedash_monitor_authorization_change',
+        'onedash_queue_metrics',
+        'onedash_reap_expired_leases',
+        'onedash_record_heartbeat',
+        'onedash_release_job',
+        'onedash_require_supported_region',
+        'onedash_schedule_due_jobs'
       )
+      and prosecdef
+  ),
+  17,
+  'all 17 Phase 4B SECURITY DEFINER functions are covered by the ownership check'
+);
+
+select is(
+  (
+    select count(*)::int
+    from pg_proc
+    where pronamespace = 'public'::regnamespace
+      and proname like 'onedash\_%'
+      and prosecdef
       and pg_get_userbyid(proowner) <> 'onedash_function_owner'
   ),
   0,
-  'all Phase 4B SECURITY DEFINER entry points are owned by the function owner'
+  'every onedash SECURITY DEFINER function is owned by the function owner'
+);
+
+select is(
+  (
+    select count(*)::int
+    from pg_proc
+    where pronamespace = 'public'::regnamespace
+      and proname like 'onedash\_%'
+      and prosecdef
+      and not coalesce(
+        proconfig,
+        '{}'::text[]
+      ) @> array['search_path=""']::text[]
+  ),
+  0,
+  'every onedash SECURITY DEFINER function has an empty search_path'
+);
+
+select is(
+  (
+    select count(*)::int
+    from pg_proc p
+    cross join lateral aclexplode(
+      coalesce(p.proacl, acldefault('f', p.proowner))
+    ) as acl
+    where p.pronamespace = 'public'::regnamespace
+      and p.proname like 'onedash\_%'
+      and p.prosecdef
+      and acl.grantee = 0
+      and acl.privilege_type = 'EXECUTE'
+  ),
+  0,
+  'PUBLIC cannot execute any Phase 4B SECURITY DEFINER function'
+);
+
+select is(
+  has_function_privilege(
+    'onedash_scheduler',
+    'public.onedash_execution_status()',
+    'EXECUTE'
+  ),
+  true,
+  'scheduler retains the execution-status grant'
+);
+
+select is(
+  has_function_privilege(
+    'onedash_queue',
+    'public.onedash_execution_status()',
+    'EXECUTE'
+  ),
+  true,
+  'queue retains the execution-status grant'
+);
+
+select is(
+  has_function_privilege(
+    'onedash_ingestor',
+    'public.onedash_queue_metrics()',
+    'EXECUTE'
+  ),
+  true,
+  'ingestor retains the queue-metrics grant'
+);
+
+select is(
+  has_function_privilege(
+    'anon',
+    'public.onedash_execution_status()',
+    'EXECUTE'
+  ),
+  false,
+  'anon cannot execute the execution-status function'
+);
+
+select is(
+  has_function_privilege(
+    'authenticated',
+    'public.onedash_queue_metrics()',
+    'EXECUTE'
+  ),
+  false,
+  'authenticated cannot execute the queue-metrics function'
 );
 
 -- A function created by the migration role must not regain the PostgreSQL
@@ -180,14 +290,19 @@ select is(
         'public.service_heartbeats',
         'public.monitor_execution_settings',
         'public.monitor_execution_allowlist',
-        'public.supported_regions'
+        'public.supported_regions',
+        'public.check_results',
+        'public.monitor_state',
+        'public.monitor_schedules',
+        'public.monitors',
+        'public.monitor_request_secrets'
       ]
     ) as t(name)
     cross join unnest(array['TRUNCATE', 'REFERENCES', 'TRIGGER']) as p(privilege)
     where has_table_privilege('service_role', t.name, p.privilege)
   ),
   0,
-  'service_role has no TRUNCATE, REFERENCES, or TRIGGER on Phase 4B tables'
+  'service_role has no TRUNCATE, REFERENCES, or TRIGGER on any of the ten tables'
 );
 
 do $$
@@ -201,7 +316,12 @@ begin
           'public.service_heartbeats',
           'public.monitor_execution_settings',
           'public.monitor_execution_allowlist',
-          'public.supported_regions'
+          'public.supported_regions',
+          'public.check_results',
+          'public.monitor_state',
+          'public.monitor_schedules',
+          'public.monitors',
+          'public.monitor_request_secrets'
         ]
       ) as t(name)
       where has_table_privilege('service_role', t.name, 'MAINTAIN')
@@ -226,7 +346,7 @@ select is(
       and roles && array['anon', 'authenticated']::name[]
   ),
   0,
-  'application roles have no direct policies on hardening tables'
+  'application roles have no direct policies on the five internal Phase 4B tables'
 );
 
 -- ============================================================

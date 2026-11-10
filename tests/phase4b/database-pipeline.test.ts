@@ -5,6 +5,7 @@ import { createFixtureChecker } from "../../worker/checker/adapter";
 import { IngestorClient } from "../../worker/ingestor/ingestor-client";
 import { createSilentLogger } from "../../worker/logging";
 import { QueueClient } from "../../worker/queue/queue-client";
+import { SchedulerClient } from "../../worker/scheduler/scheduler-client";
 import { WorkerRuntime } from "../../worker/service/worker-runtime";
 
 const ADMIN_URL =
@@ -27,6 +28,13 @@ const TEST_REGION_2 = "test-2";
 const TEST_HOST = "phase4b-fixture.test";
 const TEST_URL = `https://${TEST_HOST}/health`;
 const TEST_WORKER_ID = "phase4b-worker";
+const TEST_HEARTBEAT_IDS = [
+  "integration-scheduler",
+  TEST_WORKER_ID,
+  "phase4b-runtime-worker",
+  "phase4b-cleanup-heartbeat",
+  "phase4b-nested-heartbeat",
+] as const;
 
 function roleUrl(role: string): string {
   const url = new URL(ADMIN_URL);
@@ -445,35 +453,65 @@ afterAll(async () => {
     ingestor2?.end(),
   ]);
 
-  if (admin) {
-    try {
-      if (originalSettings) {
-        await admin.query(
-          `update public.monitor_execution_settings
-           set execution_enabled = $1,
-               mode = $2,
-               reason = $3,
-               egress_verified_at = $4,
-               egress_verified_by = $5
-           where singleton`,
-          [
-            originalSettings.execution_enabled,
-            originalSettings.mode,
-            originalSettings.reason,
-            originalSettings.egress_verified_at,
-            originalSettings.egress_verified_by,
-          ],
-        );
-      }
+  const cleanupFailures: string[] = [];
+  let cleanupAdmin: Client | null = null;
 
+  // Use a fresh privileged connection so cleanup still runs after a test
+  // failure or a broken shared admin connection.
+  try {
+    cleanupAdmin = new Client({
+      connectionString: ADMIN_URL,
+      application_name: "phase4b-test-cleanup",
+    });
+    await cleanupAdmin.connect();
+  } catch (error) {
+    cleanupFailures.push(`connect cleanup client: ${String(error)}`);
+  }
+
+  const runCleanup = async (
+    label: string,
+    action: (client: Client) => Promise<unknown>,
+  ): Promise<void> => {
+    if (!cleanupAdmin) return;
+    try {
+      await action(cleanupAdmin);
+    } catch (error) {
+      cleanupFailures.push(`${label}: ${String(error)}`);
+    }
+  };
+
+  try {
+    await runCleanup("restore execution settings", async (client) => {
+      if (!originalSettings) return;
+      await client.query(
+        `update public.monitor_execution_settings
+         set execution_enabled = $1,
+             mode = $2,
+             reason = $3,
+             egress_verified_at = $4,
+             egress_verified_by = $5
+         where singleton`,
+        [
+          originalSettings.execution_enabled,
+          originalSettings.mode,
+          originalSettings.reason,
+          originalSettings.egress_verified_at,
+          originalSettings.egress_verified_by,
+        ],
+      );
+    });
+
+    await runCleanup("restore schedules", async (client) => {
       for (const row of savedSchedules) {
-        await admin.query(
+        await client.query(
           "update public.monitor_schedules set next_run_at = $2 where id = $1",
           [row.id, row.next_run_at],
         );
       }
+    });
 
-      await admin.query(
+    await runCleanup("delete test monitors", async (client) => {
+      await client.query(
         "delete from public.monitors where id = any($1::uuid[])",
         [
           [
@@ -486,17 +524,53 @@ afterAll(async () => {
           ],
         ],
       );
+    });
 
-      await admin.query(
+    // Delete only the instance ids created by this suite. Active production
+    // or developer heartbeats with any other id are left untouched.
+    await runCleanup("delete test heartbeat records", async (client) => {
+      await client.query(
+        "delete from public.service_heartbeats where instance_id = any($1::text[])",
+        [TEST_HEARTBEAT_IDS],
+      );
+    });
+
+    await runCleanup("verify heartbeat cleanup", async (client) => {
+      const remaining = await client.query(
+        `select count(*)::int as count
+         from public.service_heartbeats
+         where instance_id = any($1::text[])`,
+        [TEST_HEARTBEAT_IDS],
+      );
+      if (remaining.rows[0].count !== 0) {
+        throw new Error(
+          `${remaining.rows[0].count} test heartbeat rows remain after cleanup`,
+        );
+      }
+    });
+
+    await runCleanup("terminate test roles", async (client) => {
+      await client.query(
         "select pg_terminate_backend(pid) from pg_stat_activity where usename = any($1::text[]) and pid <> pg_backend_pid()",
         [TEST_ROLES],
       );
-      for (const role of TEST_ROLES) {
-        await admin.query(`drop role if exists ${role}`);
-      }
-    } finally {
-      await admin.end();
+    });
+    for (const role of TEST_ROLES) {
+      await runCleanup(`drop role ${role}`, async (client) => {
+        await client.query(`drop role if exists ${role}`);
+      });
     }
+  } finally {
+    if (cleanupAdmin) {
+      await cleanupAdmin.end().catch(() => undefined);
+    }
+    if (admin) {
+      await admin.end().catch(() => undefined);
+    }
+  }
+
+  if (cleanupFailures.length > 0) {
+    throw new Error(`Phase 4B cleanup failed: ${cleanupFailures.join("; ")}`);
   }
 });
 
@@ -1825,11 +1899,17 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
       [instanceId],
     );
 
-    const cleanup = await scheduler!.query(
-      "select public.onedash_cleanup_stale_heartbeats($1) as count",
-      [86400],
-    );
-    expect(cleanup.rows[0].count).toBeGreaterThanOrEqual(1);
+    const schedulerClient = new SchedulerClient({
+      connectionString: roleUrl("onedash_test_scheduler"),
+      ssl: false,
+      max: 1,
+    });
+    try {
+      const deleted = await schedulerClient.cleanupStaleHeartbeats(86400);
+      expect(deleted).toBeGreaterThanOrEqual(1);
+    } finally {
+      await schedulerClient.close();
+    }
 
     const remaining = await admin!.query(
       "select count(*)::int as count from public.service_heartbeats where instance_id = $1",
