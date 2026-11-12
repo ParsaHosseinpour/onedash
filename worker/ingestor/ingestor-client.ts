@@ -14,6 +14,7 @@ export type IngestResult = {
   resultId: string | null;
   monitorStatus: string | null;
   reason: string | null;
+  retryable: boolean | null;
 };
 
 export type IngestorAckResult = {
@@ -50,6 +51,7 @@ function parseIngestResult(value: unknown): IngestResult {
     resultId: asNullableString(record.result_id, "result_id"),
     monitorStatus: asNullableString(record.monitor_status, "monitor_status"),
     reason: asNullableString(record.reason, "reason"),
+    retryable: typeof record.retryable === "boolean" ? record.retryable : null,
   };
 }
 

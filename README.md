@@ -4,12 +4,14 @@ OneDash is an early-stage uptime-monitoring product. The current branch adds a
 versioned Supabase database foundation with tenant isolation, RLS, a hardened
 waitlist, account bootstrap, pgTAP tests, a tenant-safe monitor configuration
 UI, a standalone Phase 4A.1 HTTP/HTTPS checker, and the Phase 4B scheduler,
-durable queue, worker service, and restricted result ingestor. The checker now
+durable queue, worker service, and restricted result ingestor. Phase 4C.0 adds
+residual security and correctness hardening to revocation, ingestion, caps,
+metrics, function privileges, cleanup, and worker timeouts. The checker now
 rejects HTTPS-to-HTTP redirect downgrades, retries a bounded set of validated
 addresses before any response, and has local trusted-TLS coverage. The
 cookie-based auth flow has been verified manually in a browser; automated
 Playwright E2E is still missing. It is **not yet an uptime monitor for
-customers**: Phase 4B runs only operator-allowlisted fixtures, the execution
+customers**: Phase 4B/4C.0 runs only operator-allowlisted fixtures, the execution
 gate is disabled by default, and the worker refuses customer mode. There is no
 alert sender or deployed public status page. See [`ROADMAP.md`](./ROADMAP.md),
 [`docs/database.md`](./docs/database.md), and
@@ -148,7 +150,7 @@ historical waitlist file; it is retained for reference and must not be applied
 after the migrations. The waitlist migration intentionally changes its grants
 to close the direct anon PostgREST INSERT bypass.
 
-The current suite has **335 pgTAP assertions** across nine files:
+The current suite has **397 pgTAP assertions** across ten files:
 
 - `001_schema_invariants.sql` — RLS coverage, indexes, constraints, function
   hardening, default privilege removal, and waitlist privileges.
@@ -174,6 +176,10 @@ The current suite has **335 pgTAP assertions** across nine files:
   `PUBLIC` execute denial, empty `search_path`, URL-bound fixture authorization,
   strict heartbeat/result validation, and `service_role` non-DML denial across
   all ten internal tables.
+- `010_phase4c_residual_security.sql` - Phase 4C.0 pending/leased revocation,
+  canonical lock ordering, ingestion revalidation and structured rejection,
+  concurrency-safe per-monitor caps, tolerant metrics, default function-execute
+  hardening, and scheduler-only bounded heartbeat cleanup.
 
 The tests run against the seeded local database. They create their own users
 and organizations inside a transaction and roll back, and they scope assertions
@@ -195,7 +201,7 @@ helpers, worker role, retention/partition plan, and known deviations.
 | `npm run test:checker` | Run only the Phase 4A.1 checker tests. |
 | `npm run test:worker` | Run worker and scheduler unit tests. |
 | `npm run test:scheduler` | Run only scheduler unit tests. |
-| `npm run test:phase4b` | Run the Phase 4B database pipeline test with four restricted-role connections (local DB required). |
+| `npm run test:phase4b` | Run the Phase 4B/4C database pipeline and residual-concurrency tests with restricted-role connections (local DB required). |
 | `npm run test:watch` | Run Vitest in watch mode. |
 | `npm run worker:build` | Compile the worker and scheduler to `dist-worker/`. |
 | `npm run worker:service` | Run the worker with `tsx`. |
@@ -297,15 +303,61 @@ npm run worker:build
 
 The database pipeline test is intentionally separate from
 `npm test`; it requires a running local Supabase database. It uses disposable
-restricted login roles and a dedicated monitor, and it covers concurrent
+restricted login roles and dedicated monitors, and it covers concurrent
 scheduler safety, idempotency, retries, dead-lettering, lease recovery, the
 execution gate, fixture allowlisting, ingestion, metrics, permission denial, and
 an end-to-end worker runtime pass through the restricted queue and ingestor
-clients.
+clients. `tests/phase4b/residual-security.test.ts` adds independent-connection
+races for the schedule and job caps, per-monitor advisory-lock namespaces,
+multi-row inserts, concurrent identical ingestion, lease expiry while blocked
+on the job row, and ingestion rejection paths.
+
+### Residual security hardening (Phase 4C.0)
+
+Phase 4C.0 is a forward-only hardening pass over the Phase 4B foundation. It
+does not activate customer monitoring, does not wire `createRealChecker` into
+the database worker, and does not change the default-disabled execution gate.
+
+- **Revocation is complete:** pausing a monitor, changing its URL, removing its
+  allowlist row, or disabling the execution gate now dead-letters both `pending`
+  and `leased` jobs. Every lease and completion field is cleared, so a stale
+  worker cannot finish a revoked job. Authorization-sensitive work follows one
+  lock order: monitor row, execution-gate row, allowlist authorization, then job
+  row.
+- **Ingestion revalidates everything:** monitor existence, active state, current
+  URL, allowlist, gate mode, lease token, and lease expiry are checked under the
+  canonical locks. Rejections are structured JSON with fixed reasons
+  (`job_not_found`, `monitor_not_found`, `execution_disabled`,
+  `monitor_not_authorized`, `lease_mismatch`, `lease_mismatch_or_expired`,
+  `job_completed_without_result`) and `retryable = false`. A rejected ingestion
+  writes no result and no monitor state.
+- **Caps are concurrency-safe:** the five-schedule and ten-pending-plus-leased
+  job limits use per-monitor transaction-scoped advisory locks with separate
+  `onedash-schedule-cap` and `onedash-job-cap` namespaces. Multi-row inserts and
+  independent connections cannot exceed the limits.
+- **Metrics tolerate legacy rows:** malformed concurrency values are ignored,
+  per-heartbeat concurrency is clamped to 0-10, and counts, ages, and totals are
+  clamped to the PostgreSQL integer range. One bad legacy row cannot fail the
+  aggregate query.
+- **Cleanup is scheduler-only and bounded:** `onedash_queue` no longer has
+  execute on `onedash_cleanup_stale_heartbeats`. The function runs with
+  `statement_timeout = 5s` and `lock_timeout = 2s`, deletes at most 1,000 rows
+  per statement and 10,000 per call, and never selects active heartbeats.
+- **Default privileges are hardened:** future functions created by `postgres` or
+  `onedash_function_owner` do not grant PUBLIC, `anon`, `authenticated`, or
+  `service_role` execute. The local `postgres` migration role is not a member of
+  `supabase_admin`, so it cannot alter that superuser's defaults or revoke
+  PUBLIC on its functions; the migration reports this limitation and an operator
+  must run the documented superuser step.
+- **Worker timeouts and rejection handling:** all worker database pools set
+  `statement_timeout = 15s`, `lock_timeout = 5s`, and
+  `idle_in_transaction_session_timeout = 10s`. Terminal ingestion rejections
+  never release or fail a job, and only an unknown retryable rejection is failed
+  with `worker_error` so the job's bounded attempt budget applies.
 
 ### Customer activation is blocked
 
-Do not enable customer monitoring with Phase 4B. Before a later phase can do
+Do not enable customer monitoring with Phase 4B or Phase 4C.0. Before a later phase can do
 that, the worker host/network must enforce egress isolation for private,
 loopback, link-local, metadata, control-plane, and Supabase private networks;
 the verification must be recorded in the execution gate; the customer
@@ -476,7 +528,7 @@ tests/                       Vitest unit/integration and component tests
 tests/checker/               Phase 4A.1 checker tests and runtime TLS fixtures
 tests/worker/                worker runtime, config, logging, payload, health tests
 tests/scheduler/             scheduler runtime tests
-tests/phase4b/               database pipeline test (four restricted roles)
+tests/phase4b/               database pipeline and residual-security tests
 worker/
   checker/                   standalone HTTP/HTTPS checker (no Next.js imports)
   queue/                     restricted queue RPC client
@@ -505,30 +557,30 @@ are included in the push filter.
 
 ## Verification status
 
-Verified locally on 2026-11-09:
+Verified locally on 2026-11-11:
 
 | Check | Result |
 | --- | --- |
-| `npm run lint` | Pass; one warning in the untracked `.opencode/graphify.js` environment plugin, no app-code findings |
+| `npm run lint` | Pass; one warning in the untracked `.opencode/plugins/graphify.js` environment plugin, no app-code findings |
 | `npm run typecheck` | Pass |
-| `npm test` | 431 tests across 33 files pass |
+| `npm test` | 440 tests across 33 files pass |
 | `npm run test:checker` | 160 checker tests across 7 files pass |
-| `npm run test:worker` | 100 worker/scheduler tests across 8 files pass |
+| `npm run test:worker` | 109 worker/scheduler tests across 8 files pass |
 | `npm run test:scheduler` | 7 scheduler tests across 1 file pass |
-| `npm run test:phase4b` | 20 database pipeline tests pass using four restricted-role connections |
+| `npm run test:phase4b` | 29 database pipeline/residual tests across 2 files pass using restricted-role connections |
 | `npm run build` | Pass |
 | `npm run worker:build` | Pass |
 | `npm audit --omit=dev` | 0 vulnerabilities |
-| `npm run db:reset` | 11 migrations + seed pass |
-| `npm run db:test` | 335 assertions across 9 files pass |
+| `npm run db:reset` | 12 migrations + seed pass |
+| `npm run db:test` | 397 assertions across 10 files pass |
 | `npm run db:lint` | No schema errors |
-| Phase 4B.2 catalog checks (read-only, local) | `service_role` non-DML privileges false on all ten tables; all 17 Phase 4B `SECURITY DEFINER` functions owned by `onedash_function_owner` |
+| Phase 4C.0 catalog checks (read-only, local) | Default function EXECUTE is revoked for `postgres` and `onedash_function_owner`; existing `SECURITY DEFINER` functions owned by those roles deny `PUBLIC` execute; the `supabase_admin` limitation is asserted and reported |
 
-Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite. Phase 4A.1 checker coverage is application-level plus local TLS; it does not prove production TLS against a publicly trusted CA or deployment egress isolation, which remain release gates. Phase 4B coverage proves the local fixtures pipeline and permission split; it does not prove customer execution, multi-region behavior, or hosted egress isolation.
+Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite. Phase 4A.1 checker coverage is application-level plus local TLS; it does not prove production TLS against a publicly trusted CA or deployment egress isolation, which remain release gates. Phase 4B/4C.0 coverage proves the local fixtures pipeline, residual revocation/ingestion hardening, and permission split; it does not prove customer execution, multi-region behavior, or hosted egress isolation.
 
 ## Known gaps and limits
 
-- Customer monitoring is not active. Phase 4B runs only operator-allowlisted
+- Customer monitoring is not active. Phase 4B/4C.0 runs only operator-allowlisted
   fixtures; the execution gate is disabled by default and `customer` mode is
   rejected by both the worker and the database functions. There is no customer
   test-check action, alert delivery, incident automation, or public status-page
@@ -551,9 +603,15 @@ Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated i
   repository. The worker host must deny private, link-local, loopback, metadata,
   control-plane, and Supabase private-network egress. If it cannot, customer
   checks are a release blocker.
-- The Phase 4B integration test is local-only. Multi-region routing,
+- The Phase 4B/4C.0 integration tests are local-only. Multi-region routing,
   confirmation/quorum, failure injection, and a 1,000-monitor load test remain
   unverified.
+- The local `postgres` migration role is not a member of `supabase_admin`, so the
+  Phase 4C.0 migration cannot alter that superuser's default function ACLs or
+  revoke `PUBLIC` execute on its functions. The migration emits notices and the
+  pgTAP suite records the limitation; an operator must run the documented
+  superuser statements before relying on default-ACL hardening for
+  `supabase_admin`-owned functions.
 - The legacy `onedash_worker` role is retained as a deprecated NOLOGIN role with
   no direct table, sequence, function, schema, or policy grants. `PUBLIC` still
   exposes schema `USAGE`, but the role has no data access. New processes must

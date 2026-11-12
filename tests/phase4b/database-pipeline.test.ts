@@ -1806,12 +1806,26 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
       scheduled: 0,
       execution_mode: "disabled",
     });
+    // Phase 4C.0: leaving enabled fixtures mode dead-letters every pending and
+    // leased job, so the job that existed before the gate was disabled is gone.
+    const revokedWhileDisabled = await admin!.query(
+      "select count(*)::int as count from public.check_jobs where id = $1 and status = 'dead_letter'",
+      [id],
+    );
+    expect(revokedWhileDisabled.rows[0].count).toBe(1);
+
     const disabledClaim = await claimFrom(queue!, "customer-gate-disabled", 5);
     expect(disabledClaim.jobs).toHaveLength(0);
 
+    // A direct operator insert while the gate is disabled is still refused by
+    // the claim function; it remains pending rather than being executed.
+    const disabledPendingId = await insertPendingJob(
+      TEST_MONITOR_ID_4,
+      "customer-gate-disabled-pending",
+    );
     const pendingWhileDisabled = await admin!.query(
       "select count(*)::int as count from public.check_jobs where id = $1 and status = 'pending'",
-      [id],
+      [disabledPendingId],
     );
     expect(pendingWhileDisabled.rows[0].count).toBe(1);
 
@@ -1839,7 +1853,7 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
 
     const pendingWhileCustomer = await admin!.query(
       "select count(*)::int as count from public.check_jobs where id = $1 and status = 'pending'",
-      [id],
+      [disabledPendingId],
     );
     expect(pendingWhileCustomer.rows[0].count).toBe(1);
 

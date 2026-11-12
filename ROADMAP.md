@@ -1,6 +1,6 @@
 # OneDash Roadmap
 
-**Status:** Phase 4B scheduler, durable queue, separate worker service, and restricted result ingestion implemented on `phase-4b/scheduler-worker` - 2026-11-04. Phase 4A.1 checker and Phase 3 control plane remain verified. Phase 4B adds a PostgreSQL job queue, fixture-only scheduling/execution, lease/retry/dead-letter handling, split scheduler/queue/ingestor roles, idempotent ingestion, metrics, and multi-connection tests. Customer monitoring is **not active**: the execution gate is disabled by default and both the scheduler and worker refuse customer mode. Multi-region execution, alert delivery, and deployment egress isolation remain unimplemented; egress isolation is a release blocker for customer checks.
+**Status:** Phase 4C.0 residual security and correctness hardening implemented on `phase-4c/0-residual-security` - 2026-11-11, based on Phase 4B commit `67f220c`. Phase 4B delivered the scheduler, durable queue, separate worker service, and restricted result ingestion on `phase-4b/scheduler-worker` (2026-11-04). Phase 4A.1 checker and Phase 3 control plane remain verified. Phase 4C.0 hardens pending/leased revocation, ingestion revalidation and structured rejection, concurrency-safe per-monitor caps, legacy-tolerant metrics, default function-execute privileges, scheduler-only bounded cleanup, and worker database/rejection timeouts. Customer monitoring is **not active**: the execution gate is disabled by default and both the scheduler and worker refuse customer mode. Multi-region execution, alert delivery, and deployment egress isolation remain unimplemented; egress isolation is a release blocker for customer checks.
 **First release scope:** real HTTP/HTTPS uptime monitoring
 **Phase 0 rule (historical):** audit only. No application behavior, SQL schema, dependency, or deployment configuration was changed.
 **Phase 2 rule:** database foundation only. No monitor UI, scheduler, checker, alert sender, deployment, or remote `db push` was added.
@@ -110,6 +110,40 @@ fixture allowlisting, aggregate metrics, permission denial, and an end-to-end
 worker runtime pass through the restricted queue and ingestor clients. It does
 not perform an arbitrary external check. Customer execution remains disabled.
 
+## Phase 4C.0 verification snapshot (2026-11-11)
+
+Phase 4C.0 was verified locally on branch `phase-4c/0-residual-security` at
+Phase 4B base commit `67f220c`, with Supabase CLI 2.122.0, Docker Desktop, and
+Node 24. It uses a local disposable database only; no remote project was linked,
+pushed, or modified.
+
+| Check | Command | Actual result |
+|---|---|---|
+| Lint | `npm run lint` | Pass; one warning in the untracked `.opencode/plugins/graphify.js` environment plugin, no app-code findings |
+| Type check | `npm run typecheck` | Pass |
+| Unit/integration/component tests | `npm test` | Pass: 33 files, 440 tests |
+| Checker-only tests | `npm run test:checker` | Pass: 7 files, 160 tests |
+| Worker/scheduler tests | `npm run test:worker` | Pass: 8 files, 109 tests |
+| Scheduler-only tests | `npm run test:scheduler` | Pass: 1 file, 7 tests |
+| Phase 4B/4C database pipeline and residual tests | `npm run test:phase4b` | Pass: 2 files, 29 tests, restricted-role connections |
+| Production build (no Supabase env) | `npm run build` | Pass |
+| Worker build | `npm run worker:build` | Pass |
+| Runtime dependency audit | `npm audit --omit=dev` | 0 vulnerabilities |
+| Migrations from empty | `npm run db:reset` | Pass: 12 migrations + seed |
+| Database/RLS/queue/permission tests | `npm run db:test` | Pass: 10 files, 397 assertions |
+| Database lint | `npm run db:lint` | Pass: no schema errors |
+
+The Phase 4C.0 residual integration test uses independent restricted-role
+connections to verify six schedule inserts stop at five, eleven job inserts stop
+at ten, multi-row inserts cannot bypass either cap, schedule and job advisory
+namespaces do not block each other, concurrent identical ingestion writes one
+result, a lease that expires while the ingestor waits on the job row is
+rejected, and every rejection reason leaves no result or monitor-state write.
+The pgTAP suite covers pending/leased revocation, canonical lock ordering,
+revalidation, malformed legacy metrics, default function-execute hardening, and
+scheduler-only bounded cleanup. Customer execution remains disabled and the real
+checker is not wired into the database worker.
+
 ---
 
 ## 1. Executive summary
@@ -123,11 +157,12 @@ not perform an arbitrary external check. Customer execution remains disabled.
 - A protected `/dashboard` with tenant-scoped monitor configuration: list, detail, create, edit, pause/resume, and delete.
 - A standalone Phase 4A HTTP/HTTPS checker foundation with SSRF/DNS-rebinding defenses and independent tests.
 - A Phase 4B fixture-only scheduler, durable PostgreSQL queue, separate worker service, restricted result ingestor, split database roles, metrics, and multi-connection tests.
+- Phase 4C.0 residual hardening: pending/leased revocation, ingestion revalidation and structured rejection, concurrency-safe per-monitor caps, legacy-tolerant metrics, default function-execute hardening, scheduler-only bounded cleanup, and worker database/rejection timeouts.
 - Versioned migrations, RLS, seed data, pgTAP database tests, Vitest tests, and CI.
 
 ### What does not exist
 
-- Customer checks, alert delivery, operational incident/status-page management, teams/invitations, billing, or public APIs. Phase 4B stores fixture results only; it does not create incidents or notifications.
+- Customer checks, alert delivery, operational incident/status-page management, teams/invitations, billing, or public APIs. Phase 4B/4C.0 stores fixture results only; it does not create incidents or notifications.
 - Multi-region execution, confirmation/quorum policy, or a hosted production data plane with enforced worker egress isolation.
 - Automated Playwright auth or monitor E2E coverage.
 
@@ -696,12 +731,14 @@ not being executed yet.
 
 **Goal:** execute checks reliably from isolated workers and persist trustworthy results.
 
-**Phase 4A/4B status (2026-11-04): Phase 4B fixture-only scheduler, queue,
-worker, and ingestion delivered on `phase-4b/scheduler-worker`.** The standalone
-checker in `worker/checker/` remains independently tested. The new scheduler
-and worker are separate Node processes; the checker module still has no database
-client. Customer monitoring is not active: the execution gate is disabled by
-default and both the scheduler and worker refuse customer mode.
+**Phase 4A/4B/4C.0 status (2026-11-11): Phase 4B fixture-only scheduler, queue,
+worker, and ingestion were delivered on `phase-4b/scheduler-worker`, and Phase
+4C.0 residual security/correctness hardening is delivered on
+`phase-4c/0-residual-security`.** The standalone checker in `worker/checker/`
+remains independently tested. The new scheduler and worker are separate Node
+processes; the checker module still has no database client. Customer monitoring
+is not active: the execution gate is disabled by default and both the scheduler
+and worker refuse customer mode.
 
 Phase 4A delivered:
 
@@ -781,6 +818,33 @@ Phase 4B delivered (2026-11-04):
   connections and does not call an arbitrary external website.
 - Documentation for the queue decision, permissions, metrics, activation
   prerequisites, and remaining egress blocker.
+
+Phase 4C.0 delivered (2026-11-11):
+
+- Pending and leased jobs are both dead-lettered on monitor pause, URL change,
+  allowlist removal, or execution-gate disable, with all lease and completion
+  fields cleared.
+- Ingestion revalidates monitor existence, active state, current URL, allowlist,
+  gate mode, lease token, and lease expiry under the canonical lock order
+  (monitor, gate, allowlist, job). Rejections return fixed reasons with
+  `retryable = false` and write no result or monitor state.
+- The five-schedule and ten-pending-plus-leased-job caps are serialized per
+  monitor with transaction-scoped advisory locks in separate namespaces.
+- Queue metrics ignore malformed legacy concurrency values and clamp every
+  count, age, and aggregate to the PostgreSQL integer range.
+- Default PUBLIC/application-role function execute is revoked for future
+  functions created by `postgres` and `onedash_function_owner`. The
+  `supabase_admin` limitation is reported as an operator follow-up because the
+  local migration role is not a member.
+- Heartbeat cleanup is scheduler-only, bounded to 1,000 rows per statement and
+  10,000 per call, and runs with function-level statement/lock timeouts.
+- Worker ingestion rejections are classified in TypeScript: terminal reasons
+  never release or fail the job, only unknown retryable rejections use the
+  bounded retry path, and worker database pools have statement, lock, and
+  idle-in-transaction timeouts.
+- pgTAP coverage for Findings A-E plus a multi-connection residual-security
+  integration suite for cap races, lock namespaces, concurrent ingestion, and
+  rejection/no-write behavior.
 
 Deferred to Phase 4C/5:
 
