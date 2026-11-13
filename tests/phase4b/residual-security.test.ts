@@ -440,83 +440,75 @@ describe("Phase 4C residual concurrency and ingestion hardening", () => {
     expect(result.rows[0].count).toBe(10);
   });
 
-  it("uses separate per-monitor namespaces for job and schedule caps", async () => {
+  it("serializes job and schedule inserts on the global cap-enforcement lock", async () => {
     const lockHolder = await connect(ADMIN_URL, "phase4c-residual-lock-holder");
-    const scheduleLockHolder = await connect(
+    const jobWriter = await connect(ADMIN_URL, "phase4c-residual-job-writer");
+    const scheduleWriter = await connect(
       ADMIN_URL,
-      "phase4c-residual-schedule-lock-holder",
-    );
-    const otherMonitor = await connect(
-      ADMIN_URL,
-      "phase4c-residual-other-monitor",
-    );
-    const blockedMonitor = await connect(
-      ADMIN_URL,
-      "phase4c-residual-blocked-monitor",
-    );
-    const sameMonitorJob = await connect(
-      ADMIN_URL,
-      "phase4c-residual-same-monitor-job",
+      "phase4c-residual-schedule-writer",
     );
 
     try {
       await lockHolder.query("begin");
       await lockHolder.query(
-        "select pg_advisory_xact_lock(hashtextextended('onedash-job-cap:' || $1, 0))",
-        [MONITOR_LOCK],
+        "select pg_advisory_xact_lock(hashtextextended('onedash-cap-enforcement', 0))",
       );
 
-      await otherMonitor.query("set statement_timeout = '2s'");
-      const other = await otherMonitor.query(
-        `insert into public.check_jobs (
-           organization_id, monitor_id, region, scheduled_for, available_at,
-           idempotency_key, status
-         )
-         values ($1, $2, $3, now(), now(), '4c-integration-other-monitor', 'pending')
-         returning id`,
-        [organizationId, MONITOR_CROSS_B, TEST_REGION],
-      );
-      expect(other.rowCount).toBe(1);
-
-      await blockedMonitor.query("set statement_timeout = '500ms'");
+      await jobWriter.query("set statement_timeout = '500ms'");
       await expect(
-        blockedMonitor.query(
+        jobWriter.query(
           `insert into public.check_jobs (
              organization_id, monitor_id, region, scheduled_for, available_at,
              idempotency_key, status
            )
-           values ($1, $2, $3, now(), now(), '4c-integration-blocked-monitor', 'pending')
+           values ($1, $2, $3, now(), now(), '4c-integration-global-lock-job', 'pending')
+           returning id`,
+          [organizationId, MONITOR_NAMESPACE, TEST_REGION],
+        ),
+      ).rejects.toMatchObject({ code: "57014" });
+
+      await scheduleWriter.query("set statement_timeout = '500ms'");
+      await expect(
+        scheduleWriter.query(
+          `insert into public.monitor_schedules (
+             organization_id, monitor_id, region, next_run_at
+           )
+           values ($1, $2, $3, null)
            returning id`,
           [organizationId, MONITOR_LOCK, TEST_REGION],
         ),
       ).rejects.toMatchObject({ code: "57014" });
 
-      await scheduleLockHolder.query("begin");
-      await scheduleLockHolder.query(
-        "select pg_advisory_xact_lock(hashtextextended('onedash-schedule-cap:' || $1, 0))",
-        [MONITOR_NAMESPACE],
-      );
+      await lockHolder.query("rollback");
 
-      await sameMonitorJob.query("set statement_timeout = '2s'");
-      const job = await sameMonitorJob.query(
+      await jobWriter.query("set statement_timeout = '2s'");
+      const job = await jobWriter.query(
         `insert into public.check_jobs (
            organization_id, monitor_id, region, scheduled_for, available_at,
            idempotency_key, status
          )
-         values ($1, $2, $3, now(), now(), '4c-integration-namespace-job', 'pending')
+         values ($1, $2, $3, now(), now(), '4c-integration-global-lock-job', 'pending')
          returning id`,
         [organizationId, MONITOR_NAMESPACE, TEST_REGION],
       );
       expect(job.rowCount).toBe(1);
+
+      await scheduleWriter.query("set statement_timeout = '2s'");
+      const schedule = await scheduleWriter.query(
+        `insert into public.monitor_schedules (
+           organization_id, monitor_id, region, next_run_at
+         )
+         values ($1, $2, $3, null)
+         returning id`,
+        [organizationId, MONITOR_LOCK, TEST_REGION],
+      );
+      expect(schedule.rowCount).toBe(1);
     } finally {
       await Promise.allSettled([
         lockHolder.query("rollback"),
-        scheduleLockHolder.query("rollback"),
         lockHolder.end(),
-        scheduleLockHolder.end(),
-        otherMonitor.end(),
-        blockedMonitor.end(),
-        sameMonitorJob.end(),
+        jobWriter.end(),
+        scheduleWriter.end(),
       ]);
     }
   });

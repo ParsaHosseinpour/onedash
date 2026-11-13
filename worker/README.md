@@ -1,8 +1,8 @@
-# OneDash worker, scheduler, and checker (Phase 4B/4C.0)
+# OneDash worker, scheduler, and checker (Phase 4B/4C.0.1)
 
 This directory contains the Phase 4B scheduler, queue client, worker service,
-ingestor client, and the Phase 4A.1 HTTP/HTTPS checker. Phase 4C.0 adds residual
-security hardening to the worker and database contract. The worker and scheduler
+ingestor client, and the Phase 4A.1 HTTP/HTTPS checker. Phase 4C.0.1 adds the
+independent-audit remediation to the worker and database contract. The worker and scheduler
 are standalone Node processes with no Next.js imports. The checker itself has no
 database client and no scheduler. Phase 4B stores checker output for
 operator-allowlisted fixtures only; fixture output is synthetic `.test` data,
@@ -69,8 +69,10 @@ npm run test:phase4b
 ```
 
 The suite covers the original four-connection pipeline plus independent-
-connection cap races, per-monitor advisory-lock namespaces, multi-row inserts,
-concurrent identical ingestion, and ingestion rejection/no-write behavior.
+connection cap races, the shared global cap-enforcement lock, multi-row inserts,
+concurrent identical ingestion, ingestion rejection/no-write behavior,
+opposite-order multi-monitor job/schedule inserts, and execution-gate disable
+races against claims and scheduling.
 
 ## Phase 4B runtime
 
@@ -243,16 +245,30 @@ new group roles have no direct table access either; they only execute their
 restricted functions. The checker module has no database credential and no
 service-role key.
 
-Phase 4C.0 revokes default function EXECUTE for future functions created by
-`postgres` and `onedash_function_owner` from PUBLIC and application roles. The
-local `postgres` role is not a member of `supabase_admin`, so it cannot alter
-that superuser's defaults or revoke PUBLIC on its functions. The migration
-reports this as a notice; an operator must run the documented superuser
-statements before relying on the hardening for `supabase_admin`-owned functions.
+Phase 4C.0.1 explicitly revokes EXECUTE from PUBLIC, `anon`, `authenticated`,
+and `service_role` on every application `SECURITY DEFINER` function, then
+regrants only the documented RPC exceptions and the worker group matrix. The
+worker roles cannot call trigger helpers or internal authorization helpers. It
+also revokes default EXECUTE for future functions created by `postgres` and
+`onedash_function_owner` from those roles. The local `postgres` role is not a
+member of `supabase_admin`, so it cannot alter that superuser's defaults or
+revoke grants on its functions. The migration reports this as an external
+production blocker; an operator must run
+`docs/runbooks/supabase-admin-function-acl.md` as `supabase_admin` or a
+superuser before relying on the hardening for hosted `supabase_admin`-owned
+functions.
+
+Schedule and job inserts share one transaction-scoped `onedash-cap-enforcement`
+advisory lock. A scheduler tick may therefore wait behind another cap-enforced
+insert while the system remains fixtures-only; this is the intentional trade-off
+that removes opposite-order multi-monitor deadlocks. Claims and scheduling also
+take `FOR SHARE` on the execution-gate row. If an operator disables the gate
+concurrently, the worker call either observes the disabled state or finishes
+first and is then dead-lettered by the gate trigger.
 
 ### Activation prerequisites
 
-Do not enable customer monitoring with Phase 4B. The scheduler and claim
+Do not enable customer monitoring with Phase 4B/4C.0.1. The scheduler and claim
 function intentionally refuse `customer` mode even if the gate is changed. A
 later phase must:
 
