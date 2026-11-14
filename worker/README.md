@@ -1,7 +1,8 @@
-# OneDash worker, scheduler, and checker (Phase 4B)
+# OneDash worker, scheduler, and checker (Phase 4B/4C.0.1)
 
 This directory contains the Phase 4B scheduler, queue client, worker service,
-ingestor client, and the Phase 4A.1 HTTP/HTTPS checker. The worker and scheduler
+ingestor client, and the Phase 4A.1 HTTP/HTTPS checker. Phase 4C.0.1 adds the
+independent-audit remediation to the worker and database contract. The worker and scheduler
 are standalone Node processes with no Next.js imports. The checker itself has no
 database client and no scheduler. Phase 4B stores checker output for
 operator-allowlisted fixtures only; fixture output is synthetic `.test` data,
@@ -60,12 +61,18 @@ npm run test:worker
 npm run test:scheduler
 ```
 
-The database pipeline test (four restricted-role connections) requires a
-running local Supabase database and uses disposable restricted-role login roles:
+The database pipeline and residual-concurrency tests require a running local
+Supabase database and use disposable restricted-role login roles:
 
 ```bash
 npm run test:phase4b
 ```
+
+The suite covers the original four-connection pipeline plus independent-
+connection cap races, the shared global cap-enforcement lock, multi-row inserts,
+concurrent identical ingestion, ingestion rejection/no-write behavior,
+opposite-order multi-monitor job/schedule inserts, and execution-gate disable
+races against claims and scheduling.
 
 ## Phase 4B runtime
 
@@ -103,11 +110,14 @@ process manager. Never commit connection strings or metrics tokens.
 ### Scheduler heartbeat cleanup
 
 The scheduler calls `onedash_cleanup_stale_heartbeats(86400)` at most once per
-hour. The function deletes heartbeat rows whose `last_seen_at` is older than 24
-hours, which is far longer than the normal scheduler/worker heartbeat interval,
-so active services are never deleted. The scheduler uses its existing
-least-privileged `onedash_scheduler` connection; no extra role or service is
-introduced.
+hour. Phase 4C.0 makes the function scheduler-only: `onedash_queue` and all
+application roles are denied execute. The function deletes heartbeat rows whose
+`last_seen_at` is strictly older than 24 hours, in batches of at most 1,000 rows
+per statement and 10,000 per call, using `FOR UPDATE SKIP LOCKED`. It runs with
+function-level `statement_timeout = 5s` and `lock_timeout = 2s`. The retention
+is far longer than the normal scheduler/worker heartbeat interval, so active
+services are never deleted. The scheduler uses its existing least-privileged
+`onedash_scheduler` connection; no extra role or service is introduced.
 
 A cleanup failure is logged as `heartbeat_cleanup_failed` and recorded in the
 last-error metric, but it does not skip lease reaping, scheduling, or the
@@ -160,12 +170,15 @@ when a token is configured. The token is required when the health host is not
 loopback. Keep the health server on a private network.
 
 Runtime metrics include claimed/completed/failed/retried/released/reaped jobs,
-timeouts, check-duration count/sum/max, in-flight/concurrency, last claim and
-heartbeat times, and the last sanitized error class. Scheduler metrics include
-ticks, scheduled/skipped totals, reaped/dead-lettered totals, stale heartbeats
-deleted, the last cleanup and heartbeat times, and the last sanitized error
-class. Queue metrics include depth, oldest pending age, leased count,
-expired-lease count, and completed/failed/retried counters.
+timeouts, ingestion rejections and their last fixed reason, check-duration
+count/sum/max, in-flight/concurrency, last claim and heartbeat times, and the
+last sanitized error class. Scheduler metrics include ticks, scheduled/skipped
+totals, reaped/dead-lettered totals, stale heartbeats deleted, the last cleanup
+and heartbeat times, and the last sanitized error class. Queue metrics include
+depth, oldest pending age, leased count, expired-lease count, and
+completed/failed/retried counters. Phase 4C.0 clamps every queue-metric count,
+age, duration, and total to the integer range and ignores malformed legacy
+heartbeat concurrency values instead of failing the whole query.
 
 ### Queue and ingestion behavior
 
@@ -189,6 +202,31 @@ expired-lease count, and completed/failed/retried counters.
   work where possible, waits for the configured grace period, and closes the
   database pools.
 
+### Phase 4C.0 rejection and timeout behavior
+
+- The database returns ingestion rejections as structured JSON with a fixed
+  reason and `retryable = false`: `job_not_found`, `monitor_not_found`,
+  `execution_disabled`, `monitor_not_authorized`, `lease_mismatch`,
+  `lease_mismatch_or_expired`, and `job_completed_without_result`.
+- The worker treats those reasons as terminal for its current lease. It does not
+  release the job, call `onedash_fail_job`, retry, or acknowledge it. The job is already
+  revoked, dead-lettered, completed, or owned by another worker; touching it
+  could interfere with that owner. The database remains the final lease
+  authority.
+- Only an unknown reason marked `retryable = true` uses the bounded retry path
+  with `worker_error`. This cannot bypass the job's `max_attempts` budget, and
+  `fail_job` still checks the lease token.
+- A completed job without a stored result is logged as `ingest_inconsistent`
+  and sets the last error class to `worker_error`; it is never retried.
+- Runtime metrics expose `ingestRejectedTotal` and
+  `lastIngestRejectionReason`; logs contain the fixed reason and job ID only,
+  never a URL, hostname, payload, or database error text.
+- Every worker database pool sets `statement_timeout = 15s`,
+  `lock_timeout = 5s`, and `idle_in_transaction_session_timeout = 10s` by
+  default. These protect queue, ingestor, scheduler, and health queries from a
+  stuck lock or an abandoned transaction. The cleanup function has its own
+  tighter database-side timeouts.
+
 ### Data-plane permissions
 
 The migration creates `onedash_scheduler`, `onedash_queue`, and
@@ -207,9 +245,30 @@ new group roles have no direct table access either; they only execute their
 restricted functions. The checker module has no database credential and no
 service-role key.
 
+Phase 4C.0.1 explicitly revokes EXECUTE from PUBLIC, `anon`, `authenticated`,
+and `service_role` on every application `SECURITY DEFINER` function, then
+regrants only the documented RPC exceptions and the worker group matrix. The
+worker roles cannot call trigger helpers or internal authorization helpers. It
+also revokes default EXECUTE for future functions created by `postgres` and
+`onedash_function_owner` from those roles. The local `postgres` role is not a
+member of `supabase_admin`, so it cannot alter that superuser's defaults or
+revoke grants on its functions. The migration reports this as an external
+production blocker; an operator must run
+`docs/runbooks/supabase-admin-function-acl.md` as `supabase_admin` or a
+superuser before relying on the hardening for hosted `supabase_admin`-owned
+functions.
+
+Schedule and job inserts share one transaction-scoped `onedash-cap-enforcement`
+advisory lock. A scheduler tick may therefore wait behind another cap-enforced
+insert while the system remains fixtures-only; this is the intentional trade-off
+that removes opposite-order multi-monitor deadlocks. Claims and scheduling also
+take `FOR SHARE` on the execution-gate row. If an operator disables the gate
+concurrently, the worker call either observes the disabled state or finishes
+first and is then dead-lettered by the gate trigger.
+
 ### Activation prerequisites
 
-Do not enable customer monitoring with Phase 4B. The scheduler and claim
+Do not enable customer monitoring with Phase 4B/4C.0.1. The scheduler and claim
 function intentionally refuse `customer` mode even if the gate is changed. A
 later phase must:
 

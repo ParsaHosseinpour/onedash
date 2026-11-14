@@ -218,6 +218,7 @@ class FakeIngestor implements WorkerIngestor {
     resultId: "result-1",
     monitorStatus: "up",
     reason: null,
+    retryable: null,
   };
   ingests: Array<{
     jobId: string;
@@ -349,6 +350,119 @@ describe("WorkerRuntime runOnce", () => {
     expect(runtime.getMetrics().checkDurationCount).toBe(1);
     expect(runtime.getMetrics().checkDurationSumMs).toBe(10);
     expect(queue.failures).toHaveLength(0);
+  });
+
+  it.each([
+    "job_not_found",
+    "monitor_not_found",
+    "execution_disabled",
+    "monitor_not_authorized",
+    "lease_mismatch",
+    "lease_mismatch_or_expired",
+    "job_completed_without_result",
+  ])(
+    "treats the %s ingestion rejection as terminal and never releases or fails the job",
+    async (reason) => {
+      const queue = new FakeQueue();
+      queue.claimResult = {
+        jobs: [job()],
+        executionMode: "fixtures",
+        reason: null,
+        claimedAt: null,
+      };
+      const ingestor = new FakeIngestor();
+      ingestor.result = {
+        ok: false,
+        duplicate: false,
+        jobStatus: null,
+        resultId: null,
+        monitorStatus: null,
+        reason,
+        retryable: false,
+      };
+      const { runtime } = setup({ queue, ingestor });
+
+      await runtime.runOnce();
+      await runtime.waitForIdle();
+
+      expect(queue.releases).toHaveLength(0);
+      expect(queue.failures).toHaveLength(0);
+      expect(runtime.getMetrics()).toMatchObject({
+        completedTotal: 0,
+        ingestRejectedTotal: 1,
+        lastIngestRejectionReason: reason,
+      });
+    },
+  );
+
+  it("retries only an unknown retryable ingestion rejection", async () => {
+    const queue = new FakeQueue();
+    queue.claimResult = {
+      jobs: [job()],
+      executionMode: "fixtures",
+      reason: null,
+      claimedAt: null,
+    };
+    const ingestor = new FakeIngestor();
+    ingestor.result = {
+      ok: false,
+      duplicate: false,
+      jobStatus: null,
+      resultId: null,
+      monitorStatus: null,
+      reason: "temporary_database_error",
+      retryable: true,
+    };
+    const { runtime } = setup({ queue, ingestor });
+
+    await runtime.runOnce();
+    await runtime.waitForIdle();
+
+    expect(queue.releases).toHaveLength(0);
+    expect(queue.failures).toHaveLength(1);
+    expect(queue.failures[0]).toMatchObject({
+      errorClass: "worker_error",
+      retryable: true,
+    });
+    expect(runtime.getMetrics()).toMatchObject({
+      completedTotal: 0,
+      retriedTotal: 1,
+      ingestRejectedTotal: 1,
+      lastIngestRejectionReason: "unknown",
+    });
+  });
+
+  it("does not retry a terminal reason even if the ingestor marks it retryable", async () => {
+    const queue = new FakeQueue();
+    queue.claimResult = {
+      jobs: [job()],
+      executionMode: "fixtures",
+      reason: null,
+      claimedAt: null,
+    };
+    const ingestor = new FakeIngestor();
+    ingestor.result = {
+      ok: false,
+      duplicate: false,
+      jobStatus: null,
+      resultId: null,
+      monitorStatus: null,
+      reason: "lease_mismatch_or_expired",
+      retryable: true,
+    };
+    const { runtime } = setup({ queue, ingestor });
+
+    await runtime.runOnce();
+    await runtime.waitForIdle();
+
+    expect(queue.releases).toHaveLength(0);
+    expect(queue.failures).toHaveLength(0);
+    expect(runtime.getMetrics()).toMatchObject({
+      completedTotal: 0,
+      retriedTotal: 0,
+      ingestRejectedTotal: 1,
+      lastIngestRejectionReason: "lease_mismatch_or_expired",
+    });
   });
 
   it("schedules an exponential-backoff retry for a checker timeout", async () => {
