@@ -251,6 +251,14 @@ set mode = 'disabled',
     egress_verified_by = null
 where singleton;
 
+-- Phase 4C.0.2: gate disable only opens a bounded cleanup epoch. The operator
+-- must run cleanup batches; this fixture is smaller than one batch.
+select is(
+  public.onedash_dead_letter_all_jobs('blocked_target'),
+  4,
+  'bounded gate cleanup dead-letters the fixture batch'
+);
+
 select is(
   (
     select count(*)::int
@@ -264,7 +272,7 @@ select is(
       and completed_at is null
   ),
   4,
-  'disabling the execution gate dead-letters pending and leased jobs across monitors and clears every ownership field'
+  'disabling the execution gate plus cleanup dead-letters pending and leased jobs across monitors and clears every ownership field'
 );
 
 update public.monitor_execution_settings
@@ -686,6 +694,17 @@ set mode = 'disabled',
     egress_verified_at = null,
     egress_verified_by = null
 where singleton;
+
+-- Phase 4C.0.2: cleanup is a separate bounded call that revokes every pending
+-- or leased job, including the cap fixtures created earlier. The leased
+-- ingestion fixture is revoked before ingestion runs, so its stale token cannot
+-- be accepted.
+select cmp_ok(
+  public.onedash_dead_letter_all_jobs('blocked_target'),
+  '>=',
+  1,
+  'bounded gate cleanup revokes the leased ingestion fixture and older pending fixtures'
+);
 
 select is(
   public.onedash_ingest_check_result(

@@ -29,6 +29,12 @@ const ALL_MONITORS = [
   MONITOR_MIXED_B,
 ] as const;
 
+const CLEANUP_MONITOR_IDS = Array.from(
+  { length: 11 },
+  (_, index) =>
+    `4c120000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+);
+
 const TEST_REGION = "test-1";
 const TEST_REGION_2 = "test-2";
 const TEST_HOST = "phase4c01-race.test";
@@ -112,6 +118,32 @@ async function setGate(
      where singleton`,
     [enabled, mode, reason],
   );
+}
+
+async function cleanupBatches(
+  client: Client,
+  maxBatches = 100,
+): Promise<number> {
+  let total = 0;
+  for (let batch = 0; batch < maxBatches; batch += 1) {
+    const result = await client.query<{ count: number }>(
+      "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
+    );
+    const count = Number(result.rows[0].count);
+    total += count;
+    if (count === 0) return total;
+  }
+  throw new Error("bounded gate cleanup did not converge");
+}
+
+async function drainAndEnableFixtures(): Promise<void> {
+  await admin!.query(
+    `update public.monitor_execution_settings
+     set execution_enabled = false, mode = 'disabled', reason = 'phase4c02 test cleanup'
+     where singleton`,
+  );
+  await cleanupBatches(admin!);
+  await setGate(true, "fixtures", "phase4c01 concurrency test");
 }
 
 async function insertPendingJob(
@@ -248,7 +280,9 @@ beforeAll(async () => {
     "select * from public.monitor_execution_settings where singleton",
   );
   originalSettings = settings.rows[0] ?? null;
-  await setGate(true, "fixtures", "phase4c01 concurrency test");
+  // Start from a clean, enabled fixtures gate: disable first so any nonterminal
+  // row left by an interrupted run can be drained in bounded batches.
+  await drainAndEnableFixtures();
 
   const saved = await admin.query(
     `select id, next_run_at
@@ -279,6 +313,15 @@ afterAll(async () => {
   let cleanup: Client | null = null;
   try {
     cleanup = await connect(ADMIN_URL, "phase4c01-cleanup");
+    // Drain before restoring settings: the original gate may be disabled while
+    // the test suite leaves nonterminal fixtures, and Reactivating a gate with
+    // live work is correctly rejected.
+    await cleanup.query(
+      `update public.monitor_execution_settings
+       set execution_enabled = false, mode = 'disabled', reason = 'phase4c02 test cleanup'
+       where singleton`,
+    );
+    await cleanupBatches(cleanup);
     if (originalSettings) {
       await cleanup.query(
         `update public.monitor_execution_settings
@@ -551,6 +594,17 @@ describe("Phase 4C.0.1 execution-gate locking (A-1)", () => {
         [jobId],
       );
       expect(job.rows[0]).toMatchObject({
+        status: "pending",
+        lease_token: null,
+        lease_owner: null,
+      });
+
+      expect(await cleanupBatches(admin!)).toBeGreaterThanOrEqual(1);
+      const revoked = await admin!.query(
+        "select status::text, lease_token, lease_owner from public.check_jobs where id = $1",
+        [jobId],
+      );
+      expect(revoked.rows[0]).toMatchObject({
         status: "dead_letter",
         lease_token: null,
         lease_owner: null,
@@ -561,8 +615,8 @@ describe("Phase 4C.0.1 execution-gate locking (A-1)", () => {
         disabler.query("rollback"),
         disabler.end(),
         claimant.end(),
-        setGate(true, "fixtures", "phase4c01 concurrency test"),
       ]);
+      await drainAndEnableFixtures();
     }
   });
 
@@ -622,8 +676,8 @@ describe("Phase 4C.0.1 execution-gate locking (A-1)", () => {
         disabler.query("rollback"),
         disabler.end(),
         schedulerCaller.end(),
-        setGate(true, "fixtures", "phase4c01 concurrency test"),
       ]);
+      await drainAndEnableFixtures();
     }
   });
 
@@ -646,7 +700,8 @@ describe("Phase 4C.0.1 execution-gate locking (A-1)", () => {
       expect(claimed.jobs[0].job_id).toBe(jobId);
 
       // The claim transaction still holds FOR SHARE on the gate row, so the
-      // disable waits until the claim commits and then dead-letters the lease.
+      // disable waits until the claim commits. Disable itself no longer scans
+      // jobs; bounded cleanup is what revokes the lease.
       disablePromise = disabler.query(
         `update public.monitor_execution_settings
          set execution_enabled = false, mode = 'disabled', reason = 'phase4c01 claim winner'
@@ -658,6 +713,22 @@ describe("Phase 4C.0.1 execution-gate locking (A-1)", () => {
       await disablePromise;
       disablePromise = null;
 
+      const leaseBeforeCleanup = await admin!.query(
+        `select status::text, lease_token, lease_owner, completed_at
+         from public.check_jobs
+         where id = $1`,
+        [jobId],
+      );
+      expect(leaseBeforeCleanup.rows[0]).toMatchObject({
+        status: "leased",
+        completed_at: null,
+      });
+      expect(leaseBeforeCleanup.rows[0].lease_token).not.toBeNull();
+      expect(leaseBeforeCleanup.rows[0].lease_owner).toBe(
+        "phase4c01-claim-winner-worker",
+      );
+
+      expect(await cleanupBatches(admin!)).toBeGreaterThanOrEqual(1);
       const job = await admin!.query(
         `select status::text, lease_token, lease_owner, completed_at
          from public.check_jobs
@@ -676,8 +747,8 @@ describe("Phase 4C.0.1 execution-gate locking (A-1)", () => {
         claimant.query("rollback"),
         claimant.end(),
         disabler.end(),
-        setGate(true, "fixtures", "phase4c01 concurrency test"),
       ]);
+      await drainAndEnableFixtures();
     }
   });
 
@@ -723,6 +794,21 @@ describe("Phase 4C.0.1 execution-gate locking (A-1)", () => {
       await disablePromise;
       disablePromise = null;
 
+      const beforeCleanup = await admin!.query(
+        `select status::text, lease_token, lease_owner
+         from public.check_jobs
+         where monitor_id = $1
+         order by scheduled_for desc
+         limit 1`,
+        [MONITOR_SCHEDULE],
+      );
+      expect(beforeCleanup.rows[0]).toMatchObject({
+        status: "pending",
+        lease_token: null,
+        lease_owner: null,
+      });
+
+      expect(await cleanupBatches(admin!)).toBeGreaterThanOrEqual(1);
       const jobs = await admin!.query(
         `select status::text, lease_token, lease_owner
          from public.check_jobs
@@ -742,8 +828,241 @@ describe("Phase 4C.0.1 execution-gate locking (A-1)", () => {
         schedulerCaller.query("rollback"),
         schedulerCaller.end(),
         disabler.end(),
-        setGate(true, "fixtures", "phase4c01 concurrency test"),
       ]);
+      await drainAndEnableFixtures();
+    }
+  });
+});
+
+describe("Phase 4C.0.2 canonical lock order (E-2)", () => {
+  it("makes the scheduler take the cap lock before locking due schedule rows", async () => {
+    await drainAndEnableFixtures();
+    await admin!.query(
+      "delete from public.check_jobs where monitor_id = $1",
+      [MONITOR_SCHEDULE],
+    );
+    await admin!.query(
+      "delete from public.monitor_schedules where monitor_id = $1",
+      [MONITOR_SCHEDULE],
+    );
+    await admin!.query(
+      `insert into public.monitor_schedules (
+         organization_id, monitor_id, region, next_run_at
+       )
+       values ($1, $2, $3, now() - interval '1 minute')`,
+      [organizationId, MONITOR_SCHEDULE, TEST_REGION],
+    );
+
+    const capHolder = await connect(ADMIN_URL, "phase4c02-cap-lock-holder");
+    const schedulerCaller = await connect(
+      roleUrl("onedash_test_4c01_scheduler"),
+      "phase4c02-schedule-waits-cap",
+    );
+    let schedulePromise: Promise<ScheduleResult> | null = null;
+
+    try {
+      await capHolder.query("begin");
+      // Mixed insert/update transaction: the job insert takes the execution
+      // gate share lock and the global cap advisory lock. The schedule update
+      // then takes the due schedule row lock.
+      await capHolder.query(jobInsertSql(), [
+        organizationId,
+        MONITOR_MIXED_A,
+        TEST_REGION,
+        "4c02-cap-lock-holder-job",
+      ]);
+      await capHolder.query(
+        `update public.monitor_schedules
+         set updated_at = now()
+         where monitor_id = $1`,
+        [MONITOR_SCHEDULE],
+      );
+
+      schedulePromise = scheduleDue(schedulerCaller);
+      await waitForLockWait("phase4c02-schedule-waits-cap");
+
+      // Under the old schedule -> cap order the scheduler would hold the
+      // schedule row and wait on the cap lock, deadlocking with this holder.
+      // The canonical gate -> cap -> schedule order makes it wait on the
+      // advisory lock before it locks any due schedule row.
+      const wait = await admin!.query(
+        `select wait_event_type, wait_event
+         from pg_stat_activity
+         where application_name = $1`,
+        ["phase4c02-schedule-waits-cap"],
+      );
+      expect(wait.rows[0]).toMatchObject({
+        wait_event_type: "Lock",
+        wait_event: "advisory",
+      });
+
+      await capHolder.query("commit");
+      const result = await schedulePromise;
+      schedulePromise = null;
+      expect(result.scheduled).toBeGreaterThanOrEqual(1);
+
+      const scheduled = await admin!.query(
+        `select count(*)::int as count
+         from public.check_jobs
+         where monitor_id = $1 and status = 'pending'`,
+        [MONITOR_SCHEDULE],
+      );
+      expect(scheduled.rows[0].count).toBe(1);
+    } finally {
+      await Promise.allSettled([
+        schedulePromise ?? Promise.resolve(),
+        capHolder.query("rollback"),
+        capHolder.end(),
+        schedulerCaller.end(),
+      ]);
+      await drainAndEnableFixtures();
+    }
+  });
+});
+
+describe("Phase 4C.0.2 bounded gate cleanup (E-3)", () => {
+  it("skips a locked row and finishes in bounded batches", async () => {
+    await drainAndEnableFixtures();
+    await admin!.query("delete from public.monitors where id = any($1::uuid[])", [
+      CLEANUP_MONITOR_IDS,
+    ]);
+    await admin!.query(
+      `insert into public.monitors (
+         id, organization_id, name, url, method, expected_status_codes,
+         interval_seconds, timeout_seconds, is_active
+       )
+       select
+         v.id,
+         $1,
+         'Phase 4C.0.2 cleanup ' || v.ordinality,
+         'https://4c02-cleanup-' || v.ordinality || '.test/health',
+         'GET',
+         array[200],
+         300,
+         5,
+         true
+       from unnest($2::uuid[]) with ordinality as v(id, ordinality)`,
+      [organizationId, CLEANUP_MONITOR_IDS],
+    );
+    await admin!.query(
+      `insert into public.check_jobs (
+         organization_id, monitor_id, region, scheduled_for, available_at,
+         idempotency_key, status
+       )
+       select
+         $1,
+         m.id,
+         $2,
+         now() + make_interval(secs => n * 10),
+         now() + make_interval(secs => n * 10),
+         '4c02-skip-locked-' || m.id::text || '-' || n,
+         'pending'
+       from unnest($3::uuid[]) as m(id)
+       cross join generate_series(1, 10) as n`,
+      [organizationId, TEST_REGION, CLEANUP_MONITOR_IDS],
+    );
+
+    const fixtureCount = await admin!.query(
+      `select count(*)::int as count
+       from public.check_jobs
+       where idempotency_key like '4c02-skip-locked-%'
+         and status = 'pending'`,
+    );
+    expect(fixtureCount.rows[0].count).toBe(110);
+
+    await admin!.query(
+      `update public.monitor_execution_settings
+       set execution_enabled = false, mode = 'disabled', reason = 'phase4c02 cleanup test'
+       where singleton`,
+    );
+
+    const locked = await admin!.query<{ id: string }>(
+      `select id
+       from public.check_jobs
+       where monitor_id = $1 and status = 'pending'
+       order by id
+       limit 1`,
+      [CLEANUP_MONITOR_IDS[0]],
+    );
+    const lockedId = locked.rows[0].id;
+    const locker = await connect(ADMIN_URL, "phase4c02-cleanup-lock-holder");
+
+    try {
+      await locker.query("begin");
+      await locker.query(
+        "select 1 from public.check_jobs where id = $1 for update",
+        [lockedId],
+      );
+
+      const first = await admin!.query<{ count: number }>(
+        "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
+      );
+      expect(Number(first.rows[0].count)).toBe(100);
+
+      const second = await admin!.query<{ count: number }>(
+        "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
+      );
+      expect(Number(second.rows[0].count)).toBe(9);
+
+      const statusWhileLocked = await admin!.query(
+        `select cleanup_required
+         from public.monitor_execution_settings
+         where singleton`,
+      );
+      expect(statusWhileLocked.rows[0].cleanup_required).toBe(true);
+
+      const pendingWhileLocked = await admin!.query(
+        `select count(*)::int as count
+         from public.check_jobs
+         where idempotency_key like '4c02-skip-locked-%'
+           and status in ('pending', 'leased')`,
+      );
+      expect(pendingWhileLocked.rows[0].count).toBe(1);
+
+      const lockedStatus = await admin!.query(
+        "select status::text from public.check_jobs where id = $1",
+        [lockedId],
+      );
+      expect(lockedStatus.rows[0].status).toBe("pending");
+
+      await locker.query("commit");
+
+      const third = await admin!.query<{ count: number }>(
+        "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
+      );
+      expect(Number(third.rows[0].count)).toBe(1);
+
+      const fourth = await admin!.query<{ count: number }>(
+        "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
+      );
+      expect(Number(fourth.rows[0].count)).toBe(0);
+
+      const statusAfterCleanup = await admin!.query(
+        `select cleanup_required
+         from public.monitor_execution_settings
+         where singleton`,
+      );
+      expect(statusAfterCleanup.rows[0].cleanup_required).toBe(false);
+
+      const cleaned = await admin!.query(
+        `select status::text, lease_owner, lease_token, lease_expires_at
+         from public.check_jobs
+         where id = $1`,
+        [lockedId],
+      );
+      expect(cleaned.rows[0]).toMatchObject({
+        status: "dead_letter",
+        lease_owner: null,
+        lease_token: null,
+        lease_expires_at: null,
+      });
+    } finally {
+      await Promise.allSettled([locker.query("rollback"), locker.end()]);
+      await admin!.query(
+        "delete from public.monitors where id = any($1::uuid[])",
+        [CLEANUP_MONITOR_IDS],
+      );
+      await drainAndEnableFixtures();
     }
   });
 });

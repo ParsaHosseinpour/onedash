@@ -228,6 +228,107 @@ select is(
   'the ingestor has no unintended SECURITY DEFINER execution grant'
 );
 
+-- Per-role effective checks make a failure identify the affected API role while
+-- still covering every one of the 35 inventoried functions.
+select is(
+  (
+    select count(*)::int
+    from onedash_4c01_expected_acl e
+    join pg_proc p on p.oid = to_regprocedure(e.signature)
+    where has_function_privilege('anon', p.oid, 'EXECUTE')
+          is distinct from e.anon_ok
+  ),
+  0,
+  'the effective anon EXECUTE matrix covers all 35 functions'
+);
+
+select is(
+  (
+    select count(*)::int
+    from onedash_4c01_expected_acl e
+    join pg_proc p on p.oid = to_regprocedure(e.signature)
+    where has_function_privilege('authenticated', p.oid, 'EXECUTE')
+          is distinct from e.authenticated_ok
+  ),
+  0,
+  'the effective authenticated EXECUTE matrix covers all 35 functions'
+);
+
+select is(
+  (
+    select count(*)::int
+    from onedash_4c01_expected_acl e
+    join pg_proc p on p.oid = to_regprocedure(e.signature)
+    where has_function_privilege('service_role', p.oid, 'EXECUTE')
+          is distinct from e.service_role_ok
+  ),
+  0,
+  'the effective service_role EXECUTE matrix covers all 35 functions'
+);
+
+select is(
+  (
+    select count(*)::int
+    from onedash_4c01_expected_acl e
+    join pg_proc p on p.oid = to_regprocedure(e.signature)
+    where has_function_privilege('onedash_scheduler', p.oid, 'EXECUTE')
+          is distinct from e.scheduler_ok
+  ),
+  0,
+  'the effective scheduler EXECUTE matrix covers all 35 functions'
+);
+
+select is(
+  (
+    select count(*)::int
+    from onedash_4c01_expected_acl e
+    join pg_proc p on p.oid = to_regprocedure(e.signature)
+    where has_function_privilege('onedash_queue', p.oid, 'EXECUTE')
+          is distinct from e.queue_ok
+  ),
+  0,
+  'the effective queue EXECUTE matrix covers all 35 functions'
+);
+
+select is(
+  (
+    select count(*)::int
+    from onedash_4c01_expected_acl e
+    join pg_proc p on p.oid = to_regprocedure(e.signature)
+    where has_function_privilege('onedash_ingestor', p.oid, 'EXECUTE')
+          is distinct from e.ingestor_ok
+  ),
+  0,
+  'the effective ingestor EXECUTE matrix covers all 35 functions'
+);
+
+-- General grantee detection: any role other than the function owner or an
+-- explicitly intended role must fail even if that role is not in the API/worker
+-- matrix above. PUBLIC is asserted separately.
+select is(
+  (
+    select count(*)::int
+    from onedash_4c01_expected_acl e
+    join pg_proc p on p.oid = to_regprocedure(e.signature)
+    cross join lateral pg_catalog.aclexplode(
+      coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))
+    ) as acl
+    join pg_roles r on r.oid = acl.grantee
+    where acl.privilege_type = 'EXECUTE'
+      and r.rolname <> pg_get_userbyid(p.proowner)
+      and not (
+        (r.rolname = 'anon' and e.anon_ok)
+        or (r.rolname = 'authenticated' and e.authenticated_ok)
+        or (r.rolname = 'service_role' and e.service_role_ok)
+        or (r.rolname = 'onedash_scheduler' and e.scheduler_ok)
+        or (r.rolname = 'onedash_queue' and e.queue_ok)
+        or (r.rolname = 'onedash_ingestor' and e.ingestor_ok)
+      )
+  ),
+  0,
+  'no SECURITY DEFINER function has an EXECUTE grant to any unexpected role'
+);
+
 select is(
   (
     select count(*)::int
@@ -294,6 +395,76 @@ select is(
   'heartbeat cleanup remains denied to the ingestor role'
 );
 
+-- Legitimate user-facing RPCs must stay available after the direct-ACL sweep.
+select is(
+  has_function_privilege('anon', 'public.waitlist_count()', 'EXECUTE'),
+  true,
+  'anon can still execute the aggregate waitlist count'
+);
+select is(
+  has_function_privilege('authenticated', 'public.waitlist_count()', 'EXECUTE'),
+  true,
+  'authenticated can still execute the aggregate waitlist count'
+);
+select is(
+  has_function_privilege('authenticated', 'public.ensure_my_account()', 'EXECUTE'),
+  true,
+  'authenticated can still bootstrap its own account'
+);
+select is(
+  has_function_privilege('authenticated', 'public.monitor_limit_per_org()', 'EXECUTE'),
+  true,
+  'authenticated can still read the development monitor limit'
+);
+select is(
+  has_function_privilege('authenticated', 'public.is_org_member(uuid)', 'EXECUTE'),
+  true,
+  'authenticated can still execute the organization membership RLS helper'
+);
+select is(
+  has_function_privilege('anon', 'public.is_org_member(uuid)', 'EXECUTE'),
+  false,
+  'anon still cannot execute the organization membership RLS helper'
+);
+
+-- Intended worker RPCs must stay available to exactly their group role.
+select is(
+  has_function_privilege(
+    'onedash_scheduler',
+    'public.onedash_schedule_due_jobs(integer,integer)',
+    'EXECUTE'
+  ),
+  true,
+  'the scheduler can still execute the scheduling RPC'
+);
+select is(
+  has_function_privilege(
+    'onedash_queue',
+    'public.onedash_claim_jobs(text,text,integer,integer,text[])',
+    'EXECUTE'
+  ),
+  true,
+  'the queue can still execute the claim RPC'
+);
+select is(
+  has_function_privilege(
+    'onedash_ingestor',
+    'public.onedash_ingest_check_result(uuid,uuid,jsonb)',
+    'EXECUTE'
+  ),
+  true,
+  'the ingestor can still execute the ingestion RPC'
+);
+select is(
+  has_function_privilege(
+    'onedash_queue',
+    'public.onedash_ingest_check_result(uuid,uuid,jsonb)',
+    'EXECUTE'
+  ),
+  false,
+  'the queue still cannot execute the ingestion RPC'
+);
+
 -- ============================================================
 -- No unintended function-owner privilege expansion
 -- ============================================================
@@ -307,6 +478,7 @@ select is(
     left join pg_roles grantee on grantee.oid = acl.grantee
     where owner.rolname = 'onedash_function_owner'
       and d.defaclobjtype = 'f'
+      and d.defaclnamespace = 'public'::regnamespace
       and acl.privilege_type = 'EXECUTE'
       and (
         acl.grantee = 0
@@ -315,6 +487,26 @@ select is(
   ),
   0,
   'the function owner default ACL grants no PUBLIC or API-role function execute'
+);
+
+select is(
+  (
+    select count(*)::int
+    from pg_default_acl d
+    join pg_roles owner on owner.oid = d.defaclrole
+    cross join lateral pg_catalog.aclexplode(d.defaclacl) as acl
+    left join pg_roles grantee on grantee.oid = acl.grantee
+    where owner.rolname = 'postgres'
+      and d.defaclobjtype = 'f'
+      and d.defaclnamespace = 'public'::regnamespace
+      and acl.privilege_type = 'EXECUTE'
+      and (
+        acl.grantee = 0
+        or grantee.rolname in ('anon', 'authenticated', 'service_role')
+      )
+  ),
+  0,
+  'the postgres default ACL grants no PUBLIC or API-role function execute'
 );
 
 select is(
@@ -405,13 +597,24 @@ where id = '4c010000-0000-4000-8000-000000000001';
 select throws_ok(
   $$
     update public.monitor_execution_allowlist
+    set monitor_id = '4c010000-0000-4000-8000-000000000002'
+    where monitor_id = '4c010000-0000-4000-8000-000000000001'
+  $$,
+  '23514',
+  null,
+  'a monitor_id-only update is rejected with 23514 before URL binding'
+);
+
+select throws_ok(
+  $$
+    update public.monitor_execution_allowlist
     set monitor_id = '4c010000-0000-4000-8000-000000000002',
         url = 'https://4c01-allowlist-b.acme.test/health'
     where monitor_id = '4c010000-0000-4000-8000-000000000001'
   $$,
   '23514',
   null,
-  'moving an allowlist row from monitor A to monitor B is rejected'
+  'an update that changes both monitor_id and URL is rejected with 23514'
 );
 
 select is(

@@ -7,11 +7,14 @@ UI, a standalone Phase 4A.1 HTTP/HTTPS checker, and the Phase 4B scheduler,
 durable queue, worker service, and restricted result ingestor. Phase 4C.0 adds
 residual security and correctness hardening. Phase 4C.0.1 adds independent-audit
 remediation for direct function grants, the execution-gate race, allowlist
-monitor identity, and multi-monitor cap deadlocks. The checker now rejects
+monitor identity, and multi-monitor cap deadlocks. Phase 4C.0.2 closes the final
+review findings: trigger-order-independent allowlist immutability, one canonical
+lock order, fail-closed bounded gate cleanup, and gate deletion/recreation
+protection. The checker now rejects
 HTTPS-to-HTTP redirect downgrades, retries a bounded set of validated addresses
 before any response, and has local trusted-TLS coverage. The cookie-based auth
 flow has been verified manually in a browser; automated Playwright E2E is still
-missing. It is **not yet an uptime monitor for customers**: Phase 4B/4C.0.1 runs
+missing. It is **not yet an uptime monitor for customers**: Phase 4B/4C.0.2 runs
 only operator-allowlisted fixtures, the execution gate is disabled by default,
 and the worker refuses customer mode. There is no
 alert sender or deployed public status page. See [`ROADMAP.md`](./ROADMAP.md),
@@ -151,7 +154,7 @@ historical waitlist file; it is retained for reference and must not be applied
 after the migrations. The waitlist migration intentionally changes its grants
 to close the direct anon PostgREST INSERT bypass.
 
-The current suite has **425 pgTAP assertions** across eleven files:
+The current suite has **475 pgTAP assertions** across twelve files:
 
 - `001_schema_invariants.sql` — RLS coverage, indexes, constraints, function
   hardening, default privilege removal, and waitlist privileges.
@@ -184,8 +187,15 @@ The current suite has **425 pgTAP assertions** across eleven files:
 - `011_phase4c01_audit_remediation.sql` - Phase 4C.0.1 explicit direct-ACL
   revocation for all application `SECURITY DEFINER` functions, execution-gate
   `FOR SHARE` locking, immutable allowlist `monitor_id`, and one global
-  cap-enforcement advisory lock. It reports the `supabase_admin` default-ACL
-  limitation as an external production blocker.
+  cap-enforcement advisory lock. Phase 4C.0.2 extends it with per-role effective
+  checks for all 35 functions, unexpected-grantee detection, public-schema
+  `postgres` default-ACL checks, and preservation of the legitimate public RPC
+  and worker grants.
+- `012_phase4c02_final_remediation.sql` - Phase 4C.0.2 bounded gate cleanup in
+  more than one batch (110 pending jobs plus a skipped locked row), immediate
+  fail-closed disable, ingestion rejection during cleanup, re-enable blocking,
+  result and job-history preservation, gate `DELETE`/`TRUNCATE` rejection,
+  missing-row behavior, and fail-closed recreation.
 
 The tests run against the seeded local database. They create their own users
 and organizations inside a transaction and roll back, and they scope assertions
@@ -318,8 +328,10 @@ races for the schedule and job caps, the shared global cap-enforcement lock,
 multi-row inserts, concurrent identical ingestion, lease expiry while blocked
 on the job row, and ingestion rejection paths.
 `tests/phase4b/audit-remediation-concurrency.test.ts` adds opposite-order
-multi-monitor job/schedule inserts, mixed schedule-and-job transactions, and
-execution-gate disable races against claims and scheduling.
+multi-monitor job/schedule inserts, mixed schedule-and-job transactions,
+execution-gate disable races against claims and scheduling, a canonical
+cap-before-schedule lock-order assertion, and a 110-job bounded cleanup that
+must finish in more than one batch.
 
 ### Residual security hardening (Phase 4C.0)
 
@@ -327,12 +339,13 @@ Phase 4C.0 is a forward-only hardening pass over the Phase 4B foundation. It
 does not activate customer monitoring, does not wire `createRealChecker` into
 the database worker, and does not change the default-disabled execution gate.
 
-- **Revocation is complete:** pausing a monitor, changing its URL, removing its
-  allowlist row, or disabling the execution gate now dead-letters both `pending`
-  and `leased` jobs. Every lease and completion field is cleared, so a stale
-  worker cannot finish a revoked job. Authorization-sensitive work follows one
-  lock order: monitor row, execution-gate row, allowlist authorization, then job
-  row.
+- **Revocation is complete:** pausing a monitor, changing its URL, or removing
+  its allowlist row dead-letters both `pending` and `leased` jobs. Disabling the
+  execution gate commits the disabled state immediately and opens a bounded
+  cleanup epoch instead of scanning jobs in the gate transaction. Every lease
+  and completion field is cleared, so a stale worker cannot finish a revoked
+  job. Authorization-sensitive work follows one canonical lock order: execution
+  gate, cap-enforcement advisory lock, schedule rows, then job rows.
 - **Ingestion revalidates everything:** monitor existence, active state, current
   URL, allowlist, gate mode, lease token, and lease expiry are checked under the
   canonical locks. Rejections are structured JSON with fixed reasons
@@ -342,10 +355,11 @@ the database worker, and does not change the default-disabled execution gate.
   writes no result and no monitor state.
 - **Caps are concurrency-safe:** the five-schedule and ten-pending-plus-leased
   job limits use one transaction-scoped `onedash-cap-enforcement` advisory lock
-  shared by both triggers. Multi-row inserts and independent connections cannot
-  exceed the limits. Serializing cap-enforced inserts globally is an intentional
-  trade-off while the system remains fixtures-only; it removes the opposite-order
-  multi-monitor deadlock.
+  shared by both triggers. The scheduler takes the gate and cap locks before
+  locking due schedule rows, so a cap-lock holder cannot deadlock with it.
+  Multi-row inserts and independent connections cannot exceed the limits.
+  Serializing cap-enforced inserts globally is an intentional trade-off while
+  the system remains fixtures-only.
 - **Metrics tolerate legacy rows:** malformed concurrency values are ignored,
   per-heartbeat concurrency is clamped to 0-10, and counts, ages, and totals are
   clamped to the PostgreSQL integer range. One bad legacy row cannot fail the
@@ -386,7 +400,8 @@ default-disabled gate, does not enable customer monitoring, and does not wire
 - **A-1 (gate race):** `onedash_claim_jobs` and `onedash_schedule_due_jobs` take
   `FOR SHARE` on the execution-gate row before validating it. A concurrent gate
   disable either commits first (the call observes it and returns no work) or
-  waits until the call commits and then dead-letters the new lease/job.
+  waits until the call commits; bounded cleanup then revokes the new
+  lease/job.
 - **A-2 (allowlist immutability):** updating
   `monitor_execution_allowlist.monitor_id` is rejected with SQLSTATE `23514`.
   Moving authorization requires delete/insert, so the old monitor's revocation
@@ -396,9 +411,39 @@ default-disabled gate, does not enable customer monitoring, and does not wire
   multi-monitor transactions serialize instead of deadlocking. The five-schedule
   and ten-pending-plus-leased-job caps are unchanged.
 
+### Final review remediation (Phase 4C.0.2)
+
+Phase 4C.0.2 is a forward-only remediation pass over Phase 4C.0.1. It keeps the
+default-disabled gate, does not enable customer monitoring, and does not wire
+`createRealChecker` into the database worker.
+
+- **E-1 (trigger-order immutability):** both allowlist BEFORE triggers reject a
+  `monitor_id` change with SQLSTATE `23514`. The URL-binding trigger fires first,
+  so checking only the lock trigger produced a different error for some updates.
+- **E-2 (one lock order):** execution gate -> cap-enforcement advisory lock ->
+  schedule rows -> job rows. The scheduler acquires the cap lock before locking
+  due schedule rows, and privileged direct inserts take the gate share lock
+  first. Ordinary `authenticated`/`anon` schedule inserts are the narrow
+  exception because they cannot set scheduler-owned fields and cannot create
+  executable work.
+- **E-3 (bounded cleanup):** gate disable commits immediately and sets
+  `cleanup_required`. Operators run `onedash_dead_letter_all_jobs('blocked_target')`
+  in 100-row `FOR UPDATE SKIP LOCKED` batches with `statement_timeout = 5s` and
+  `lock_timeout = 2s` until it returns zero. Re-enable is rejected with `23514`
+  while pending or leased work remains, and result/job history is never deleted.
+- **E-4 (gate deletion/recreation):** gate `DELETE` and `TRUNCATE` are rejected
+  with `23514`. A missing gate is fail-closed, and a recreated row must start
+  disabled so old work cannot become executable.
+- **D-1 (permission coverage):** pgTAP now checks all 35 functions per role,
+  unexpected grantees, the public-schema `postgres` default ACL, and preservation
+  of the legitimate RPC and worker grants.
+- **D-2:** still an external hosted `supabase_admin` blocker. The runbook now
+  uses an explicit reviewed inventory and does not claim the hosted default ACL
+  is fixed.
+
 ### Customer activation is blocked
 
-Do not enable customer monitoring with Phase 4B or Phase 4C.0.1. Before a later
+Do not enable customer monitoring with Phase 4B or Phase 4C.0.2. Before a later
 phase can do that, the worker host/network must enforce egress isolation for private,
 loopback, link-local, metadata, control-plane, and Supabase private networks;
 the verification must be recorded in the execution gate; the customer
@@ -598,7 +643,7 @@ are included in the push filter.
 
 ## Verification status
 
-Verified locally on 2026-11-13 on
+Verified locally on 2026-11-14 on
 `phase-4c/0.1-audit-remediation`:
 
 | Check | Result |
@@ -609,20 +654,20 @@ Verified locally on 2026-11-13 on
 | `npm run test:checker` | 160 checker tests across 7 files pass |
 | `npm run test:worker` | 109 worker/scheduler tests across 8 files pass |
 | `npm run test:scheduler` | 7 scheduler tests across 1 file pass |
-| `npm run test:phase4b` | 36 database pipeline/residual/audit-remediation tests across 3 files pass using restricted-role connections |
+| `npm run test:phase4b` | 38 database pipeline/residual/audit-remediation tests across 3 files pass using restricted-role connections |
 | `npm run build` | Pass |
 | `npm run worker:build` | Pass |
 | `npm audit --omit=dev` | 0 vulnerabilities |
-| `npm run db:reset` | 13 migrations + seed pass |
-| `npm run db:test` | 425 assertions across 11 files pass |
+| `npm run db:reset` | 14 migrations + seed pass |
+| `npm run db:test` | 475 assertions across 12 files pass |
 | `npm run db:lint` | No schema errors |
-| Phase 4C.0.1 catalog checks (read-only, local) | All 35 application `SECURITY DEFINER` functions match the explicit ACL matrix; unexpected direct grants are absent; allowlist `monitor_id` updates are rejected; the `supabase_admin` limitation is asserted and reported as an external blocker |
+| Phase 4C.0.2 catalog checks (read-only, local) | All 35 application `SECURITY DEFINER` functions match the per-role effective ACL matrix; unexpected grantees are absent; `monitor_id` updates return `23514` regardless of trigger order; bounded cleanup finishes in multiple batches; gate `DELETE`/`TRUNCATE` and unsafe re-enable are rejected; the `supabase_admin` limitation is asserted and reported as an external blocker |
 
-Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite. Phase 4A.1 checker coverage is application-level plus local TLS; it does not prove production TLS against a publicly trusted CA or deployment egress isolation, which remain release gates. Phase 4B/4C.0.1 coverage proves the local fixtures pipeline, audit remediation, and permission split; it does not prove customer execution, multi-region behavior, or hosted egress isolation.
+Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated in CI. Use the manual checklist above after auth changes. Monitor management is covered by Vitest service/action/component tests and pgTAP RLS/limit tests; it has not been added to an automated browser suite. Phase 4A.1 checker coverage is application-level plus local TLS; it does not prove production TLS against a publicly trusted CA or deployment egress isolation, which remain release gates. Phase 4B/4C.0.2 coverage proves the local fixtures pipeline, audit remediation, and permission split; it does not prove customer execution, multi-region behavior, or hosted egress isolation.
 
 ## Known gaps and limits
 
-- Customer monitoring is not active. Phase 4B/4C.0.1 runs only
+- Customer monitoring is not active. Phase 4B/4C.0.2 runs only
   operator-allowlisted fixtures; the execution gate is disabled by default and
   `customer` mode is rejected by both the worker and the database functions.
   There is no customer test-check action, alert delivery, incident automation,
@@ -645,11 +690,11 @@ Browser/cookie auth E2E passed manually on 2026-10-28; it is not yet automated i
   repository. The worker host must deny private, link-local, loopback, metadata,
   control-plane, and Supabase private-network egress. If it cannot, customer
   checks are a release blocker.
-- The Phase 4B/4C.0.1 integration tests are local-only. Multi-region routing,
+- The Phase 4B/4C.0.2 integration tests are local-only. Multi-region routing,
   confirmation/quorum, failure injection, and a 1,000-monitor load test remain
   unverified.
 - The local `postgres` migration role is not a member of `supabase_admin`, so the
-  Phase 4C.0.1 migration cannot alter that superuser's hosted default function
+  Phase 4C.0.2 migration cannot alter that superuser's hosted default function
   ACLs or revoke grants on its functions. D-2 remains an external production
   blocker. The migration reports it, and the pgTAP suite records the limitation;
   an operator must run `docs/runbooks/supabase-admin-function-acl.md` and record
