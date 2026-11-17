@@ -35,6 +35,11 @@ const CLEANUP_MONITOR_IDS = Array.from(
     `4c120000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
 );
 
+const TRANSITION_MONITOR_IDS = [
+  "4c130000-0000-4000-8000-000000000001",
+  "4c130000-0000-4000-8000-000000000002",
+] as const;
+
 const TEST_REGION = "test-1";
 const TEST_REGION_2 = "test-2";
 const TEST_HOST = "phase4c01-race.test";
@@ -120,18 +125,35 @@ async function setGate(
   );
 }
 
+type CleanupResult = {
+  updated: number;
+  remaining: number;
+  cleanup_required: boolean;
+};
+
+async function cleanupBatch(client: Client): Promise<CleanupResult> {
+  return jsonResult<CleanupResult>(
+    client,
+    "select public.onedash_dead_letter_all_jobs('blocked_target') as result",
+  );
+}
+
 async function cleanupBatches(
   client: Client,
   maxBatches = 100,
 ): Promise<number> {
   let total = 0;
   for (let batch = 0; batch < maxBatches; batch += 1) {
-    const result = await client.query<{ count: number }>(
-      "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
-    );
-    const count = Number(result.rows[0].count);
-    total += count;
-    if (count === 0) return total;
+    const cleanup = await cleanupBatch(client);
+    total += cleanup.updated;
+    // A zero-row batch only means the remaining rows are locked or otherwise
+    // unavailable. It is never completion evidence.
+    if (!cleanup.cleanup_required) return total;
+    if (cleanup.updated === 0) {
+      throw new Error(
+        `bounded gate cleanup is blocked with ${cleanup.remaining} nonterminal job(s) remaining`,
+      );
+    }
   }
   throw new Error("bounded gate cleanup did not converge");
 }
@@ -160,6 +182,53 @@ async function insertPendingJob(
     [organizationId, monitorId, TEST_REGION, idempotencyKey],
   );
   return result.rows[0].id as string;
+}
+
+async function insertPendingJobs(
+  monitorId: string,
+  keyPrefix: string,
+  count: number,
+): Promise<string[]> {
+  const result = await admin!.query<{ id: string }>(
+    `insert into public.check_jobs (
+       organization_id, monitor_id, region, scheduled_for, available_at,
+       idempotency_key, status
+     )
+     select
+       $1,
+       $2,
+       $3,
+       now() + make_interval(secs => n),
+       now() + make_interval(secs => n),
+       $4 || n::text,
+       'pending'
+     from generate_series(1, $5) as n
+     returning id`,
+    [organizationId, monitorId, TEST_REGION, keyPrefix, count],
+  );
+  return result.rows.map((row) => row.id);
+}
+
+async function seedPendingJobs(
+  monitorId: string,
+  keyPrefix: string,
+  count: number,
+): Promise<string[]> {
+  await admin!.query(
+    `insert into public.monitors (
+       id, organization_id, name, url, method, expected_status_codes,
+       interval_seconds, timeout_seconds, is_active
+     )
+     values ($1, $2, $3, $4, 'GET', array[200], 300, 5, true)`,
+    [
+      monitorId,
+      organizationId,
+      `Phase 4C.0.3 ${keyPrefix}`,
+      `https://${TEST_HOST}/${keyPrefix}`,
+    ],
+  );
+
+  return insertPendingJobs(monitorId, keyPrefix, count);
 }
 
 async function queueClaim(client: Client, workerId: string): Promise<ClaimResult> {
@@ -994,15 +1063,19 @@ describe("Phase 4C.0.2 bounded gate cleanup (E-3)", () => {
         [lockedId],
       );
 
-      const first = await admin!.query<{ count: number }>(
-        "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
-      );
-      expect(Number(first.rows[0].count)).toBe(100);
+      const first = await cleanupBatch(admin!);
+      expect(first).toEqual({
+        updated: 100,
+        remaining: 10,
+        cleanup_required: true,
+      });
 
-      const second = await admin!.query<{ count: number }>(
-        "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
-      );
-      expect(Number(second.rows[0].count)).toBe(9);
+      const second = await cleanupBatch(admin!);
+      expect(second).toEqual({
+        updated: 9,
+        remaining: 1,
+        cleanup_required: true,
+      });
 
       const statusWhileLocked = await admin!.query(
         `select cleanup_required
@@ -1027,15 +1100,19 @@ describe("Phase 4C.0.2 bounded gate cleanup (E-3)", () => {
 
       await locker.query("commit");
 
-      const third = await admin!.query<{ count: number }>(
-        "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
-      );
-      expect(Number(third.rows[0].count)).toBe(1);
+      const third = await cleanupBatch(admin!);
+      expect(third).toEqual({
+        updated: 1,
+        remaining: 0,
+        cleanup_required: false,
+      });
 
-      const fourth = await admin!.query<{ count: number }>(
-        "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
-      );
-      expect(Number(fourth.rows[0].count)).toBe(0);
+      const fourth = await cleanupBatch(admin!);
+      expect(fourth).toEqual({
+        updated: 0,
+        remaining: 0,
+        cleanup_required: false,
+      });
 
       const statusAfterCleanup = await admin!.query(
         `select cleanup_required
@@ -1062,6 +1139,233 @@ describe("Phase 4C.0.2 bounded gate cleanup (E-3)", () => {
         "delete from public.monitors where id = any($1::uuid[])",
         [CLEANUP_MONITOR_IDS],
       );
+      await drainAndEnableFixtures();
+    }
+  });
+
+  it("reports remaining work when independent connections lock every row", async () => {
+    const monitorId = TRANSITION_MONITOR_IDS[0];
+    await drainAndEnableFixtures();
+    await admin!.query(
+      "delete from public.check_jobs where monitor_id = $1",
+      [monitorId],
+    );
+    await admin!.query("delete from public.monitors where id = $1", [monitorId]);
+    await seedPendingJobs(monitorId, "4c03-all-locked-", 4);
+    await admin!.query(
+      `update public.monitor_execution_settings
+       set execution_enabled = false, mode = 'disabled', reason = 'phase4c03 all-locked test'
+       where singleton`,
+    );
+
+    const firstLocker = await connect(ADMIN_URL, "phase4c03-all-locked-a");
+    const secondLocker = await connect(ADMIN_URL, "phase4c03-all-locked-b");
+
+    const lockedIds = await admin!.query<{ id: string }>(
+      `select id
+       from public.check_jobs
+       where monitor_id = $1 and status = 'pending'
+       order by id`,
+      [monitorId],
+    );
+    const firstIds = lockedIds.rows.slice(0, 2).map((row) => row.id);
+    const secondIds = lockedIds.rows.slice(2).map((row) => row.id);
+
+    try {
+      await firstLocker.query("begin");
+      await firstLocker.query(
+        `select id
+         from public.check_jobs
+         where id = any($1::uuid[])
+         for update`,
+        [firstIds],
+      );
+
+      await secondLocker.query("begin");
+      await secondLocker.query(
+        `select id
+         from public.check_jobs
+         where id = any($1::uuid[])
+         for update`,
+        [secondIds],
+      );
+
+      // Every remaining row is locked, so this batch can only observe zero
+      // updates. The structured result must still report the outstanding work.
+      const blocked = await cleanupBatch(admin!);
+      expect(blocked).toEqual({
+        updated: 0,
+        remaining: 4,
+        cleanup_required: true,
+      });
+
+      const stillPending = await admin!.query(
+        `select count(*)::int as count
+         from public.check_jobs
+         where monitor_id = $1 and status = 'pending'`,
+        [monitorId],
+      );
+      expect(stillPending.rows[0].count).toBe(4);
+
+      await firstLocker.query("commit");
+      await secondLocker.query("commit");
+
+      expect(await cleanupBatches(admin!)).toBe(4);
+
+      const settings = await admin!.query(
+        `select cleanup_required
+         from public.monitor_execution_settings
+         where singleton`,
+      );
+      expect(settings.rows[0].cleanup_required).toBe(false);
+    } finally {
+      await Promise.allSettled([
+        firstLocker.query("rollback"),
+        secondLocker.query("rollback"),
+        firstLocker.end(),
+        secondLocker.end(),
+      ]);
+      await admin!.query(
+        "delete from public.check_jobs where monitor_id = $1",
+        [monitorId],
+      );
+      await admin!.query("delete from public.monitors where id = $1", [
+        monitorId,
+      ]);
+      await drainAndEnableFixtures();
+    }
+  });
+
+  it("serializes cleanup and gate transitions in both directions", async () => {
+    const monitorId = TRANSITION_MONITOR_IDS[1];
+    await drainAndEnableFixtures();
+    await admin!.query(
+      "delete from public.check_jobs where monitor_id = $1",
+      [monitorId],
+    );
+    await admin!.query("delete from public.monitors where id = $1", [monitorId]);
+
+    const firstJobIds = await seedPendingJobs(
+      monitorId,
+      "4c03-concurrent-",
+      2,
+    );
+    await admin!.query(
+      `update public.monitor_execution_settings
+       set execution_enabled = false, mode = 'disabled', reason = 'phase4c03 concurrent test'
+       where singleton`,
+    );
+
+    const cleanupHolder = await connect(ADMIN_URL, "phase4c03-cleanup-holder");
+    const transitionWaiter = await connect(
+      ADMIN_URL,
+      "phase4c03-transition-waiter",
+    );
+
+    try {
+      // Direction one: cleanup owns the gate row, so re-enabling waits. When it
+      // proceeds, it observes the epoch closed by the committed cleanup batch.
+      await cleanupHolder.query("begin");
+      expect(await cleanupBatch(cleanupHolder)).toEqual({
+        updated: firstJobIds.length,
+        remaining: 0,
+        cleanup_required: false,
+      });
+
+      await transitionWaiter.query("begin");
+      const transitionPromise = transitionWaiter.query(
+        `update public.monitor_execution_settings
+         set mode = 'fixtures',
+             execution_enabled = true,
+             reason = 'phase4c03 concurrent test enable'
+         where singleton`,
+      );
+      await waitForLockWait("phase4c03-transition-waiter");
+
+      await cleanupHolder.query("commit");
+      await transitionPromise;
+      await transitionWaiter.query("commit");
+
+      const enabled = await admin!.query(
+        `select mode, execution_enabled, cleanup_required
+         from public.monitor_execution_settings
+         where singleton`,
+      );
+      expect(enabled.rows[0]).toMatchObject({
+        mode: "fixtures",
+        execution_enabled: true,
+        cleanup_required: false,
+      });
+    } finally {
+      await Promise.allSettled([
+        cleanupHolder.query("rollback"),
+        transitionWaiter.query("rollback"),
+        cleanupHolder.end(),
+        transitionWaiter.end(),
+      ]);
+    }
+
+    const secondJobIds = await insertPendingJobs(
+      monitorId,
+      "4c03-concurrent-second-",
+      2,
+    );
+    const transitionHolder = await connect(
+      ADMIN_URL,
+      "phase4c03-transition-holder",
+    );
+    const cleanupWaiter = await connect(ADMIN_URL, "phase4c03-cleanup-waiter");
+
+    try {
+      // Direction two: the disable transition owns the gate row, so cleanup
+      // waits. It then observes disabled mode and dead-letters the live work
+      // instead of leaving pending rows behind.
+      await transitionHolder.query("begin");
+      await transitionHolder.query(
+        `update public.monitor_execution_settings
+         set execution_enabled = false,
+             mode = 'disabled',
+             reason = 'phase4c03 concurrent test disable'
+         where singleton`,
+      );
+
+      await cleanupWaiter.query("begin");
+      const cleanupPromise = cleanupWaiter.query(
+        "select public.onedash_dead_letter_all_jobs('blocked_target') as result",
+      );
+      await waitForLockWait("phase4c03-cleanup-waiter");
+
+      await transitionHolder.query("commit");
+      const cleanupResult = await cleanupPromise;
+      expect(cleanupResult.rows[0].result).toEqual({
+        updated: secondJobIds.length,
+        remaining: 0,
+        cleanup_required: false,
+      });
+      await cleanupWaiter.query("commit");
+
+      const revoked = await admin!.query(
+        `select count(*)::int as count
+         from public.check_jobs
+         where id = any($1::uuid[])
+           and status = 'dead_letter'`,
+        [secondJobIds],
+      );
+      expect(revoked.rows[0].count).toBe(secondJobIds.length);
+    } finally {
+      await Promise.allSettled([
+        transitionHolder.query("rollback"),
+        cleanupWaiter.query("rollback"),
+        transitionHolder.end(),
+        cleanupWaiter.end(),
+      ]);
+      await admin!.query(
+        "delete from public.check_jobs where monitor_id = $1",
+        [monitorId],
+      );
+      await admin!.query("delete from public.monitors where id = $1", [
+        monitorId,
+      ]);
       await drainAndEnableFixtures();
     }
   });

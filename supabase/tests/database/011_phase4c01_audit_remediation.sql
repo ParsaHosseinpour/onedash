@@ -579,6 +579,22 @@ select id, organization_id, url, 'phase4c01 immutability test'
 from public.monitors
 where id = '4c010000-0000-4000-8000-000000000001';
 
+-- Phase 4C.0.3: a direct pending insert requires enabled fixtures mode. Drain
+-- any baseline work first, then enable fixtures with an empty queue.
+update public.monitor_execution_settings
+set execution_enabled = false,
+    mode = 'disabled',
+    reason = 'phase4c01 immutability setup'
+where singleton;
+select public.onedash_dead_letter_all_jobs('blocked_target');
+update public.monitor_execution_settings
+set execution_enabled = true,
+    mode = 'fixtures',
+    reason = 'phase4c01 immutability test',
+    egress_verified_at = null,
+    egress_verified_by = null
+where singleton;
+
 insert into public.check_jobs (
   organization_id, monitor_id, region, scheduled_for, available_at,
   idempotency_key, status

@@ -254,8 +254,8 @@ where singleton;
 -- Phase 4C.0.2: gate disable only opens a bounded cleanup epoch. The operator
 -- must run cleanup batches; this fixture is smaller than one batch.
 select is(
-  public.onedash_dead_letter_all_jobs('blocked_target'),
-  4,
+  public.onedash_dead_letter_all_jobs('blocked_target')->>'updated',
+  '4',
   'bounded gate cleanup dead-letters the fixture batch'
 );
 
@@ -700,7 +700,7 @@ where singleton;
 -- ingestion fixture is revoked before ingestion runs, so its stale token cannot
 -- be accepted.
 select cmp_ok(
-  public.onedash_dead_letter_all_jobs('blocked_target'),
+  (public.onedash_dead_letter_all_jobs('blocked_target')->>'updated')::integer,
   '>=',
   1,
   'bounded gate cleanup revokes the leased ingestion fixture and older pending fixtures'

@@ -1,9 +1,10 @@
-# OneDash worker, scheduler, and checker (Phase 4B/4C.0.2)
+# OneDash worker, scheduler, and checker (Phase 4B/4C.0.3)
 
 This directory contains the Phase 4B scheduler, queue client, worker service,
 ingestor client, and the Phase 4A.1 HTTP/HTTPS checker. Phase 4C.0.1 adds the
-independent-audit remediation, and Phase 4C.0.2 adds the final review
-remediation, to the worker and database contract. The worker and scheduler
+independent-audit remediation, Phase 4C.0.2 adds the final review remediation,
+and Phase 4C.0.3 adds the final independent audit remediation, to the worker and
+database contract. The worker and scheduler
 are standalone Node processes with no Next.js imports. The checker itself has no
 database client and no scheduler. Phase 4B stores checker output for
 operator-allowlisted fixtures only; fixture output is synthetic `.test` data,
@@ -249,13 +250,16 @@ service-role key.
 Phase 4C.0.1 explicitly revokes EXECUTE from PUBLIC, `anon`, `authenticated`,
 and `service_role` on every application `SECURITY DEFINER` function, then
 regrants only the documented RPC exceptions and the worker group matrix. The
-worker roles cannot call trigger helpers or internal authorization helpers. It
-also revokes default EXECUTE for future functions created by `postgres` and
-`onedash_function_owner` from those roles. Phase 4C.0.2 strengthens the pgTAP
-coverage for all 35 functions per role, unexpected grantees, and preservation of
-the legitimate worker grants. The local `postgres` role is not a
+worker roles cannot call trigger helpers or internal authorization helpers.
+Phase 4C.0.3 hardens both the global and `public`-schema default function ACLs
+for `postgres` and `onedash_function_owner`, revokes internal helpers explicitly
+from the scheduler, queue, and ingestor groups, and preserves scheduler-only
+heartbeat cleanup and the intended worker RPCs. Phase 4C.0.2 and 4C.0.3
+strengthen the pgTAP coverage for all 35 functions per role, unexpected
+grantees, both default-ACL scopes, and preservation of the legitimate worker
+grants. The local `postgres` role is not a
 member of `supabase_admin`, so it cannot alter that superuser's defaults or
-revoke grants on its functions. The migration reports this as an external
+revoke grants on its functions. The migration reports each scope as an external
 production blocker; an operator must run
 `docs/runbooks/supabase-admin-function-acl.md` as `supabase_admin` or a
 superuser before relying on the hardening for hosted `supabase_admin`-owned
@@ -274,7 +278,7 @@ the queue.
 
 ### Activation prerequisites
 
-Do not enable customer monitoring with Phase 4B/4C.0.2. The scheduler and claim
+Do not enable customer monitoring with Phase 4B/4C.0.3. The scheduler and claim
 function intentionally refuse `customer` mode even if the gate is changed. A
 later phase must:
 

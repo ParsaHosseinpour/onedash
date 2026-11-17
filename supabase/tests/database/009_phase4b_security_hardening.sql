@@ -458,6 +458,15 @@ select id, organization_id, url, 'guard test'
 from public.monitors
 where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 
+-- Phase 4C.0.3: direct pending/leased inserts require enabled fixtures mode.
+update public.monitor_execution_settings
+set execution_enabled = true,
+    mode = 'fixtures',
+    reason = 'pgtap job insert guard',
+    egress_verified_at = null,
+    egress_verified_by = null
+where singleton;
+
 insert into public.check_jobs (
   organization_id, monitor_id, region, scheduled_for, available_at,
   idempotency_key, status

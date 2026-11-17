@@ -4,17 +4,17 @@ This document describes the Phase 2 database model, the Phase 3 monitor
 configuration and development limit, the Phase 4A.1 checker contract and result
 metrics, the Phase 4B scheduler/queue/ingestion foundation, the Phase 4C.0
 residual security hardening, the Phase 4C.0.1 audit remediation, the Phase
-4C.0.2 final review remediation, the migration workflow and preflight, RLS
-rules, split data-plane roles, and known gaps. It reflects the code on
-`phase-4c/0.1-audit-remediation`; it is not a claim that the schema has been
-deployed to a hosted Supabase project.
+4C.0.2 final review remediation, the Phase 4C.0.3 independent audit remediation,
+the migration workflow and preflight, RLS rules, split data-plane roles, and
+known gaps. It reflects the code on `phase-4c/0.1-audit-remediation`; it is not a
+claim that the schema has been deployed to a hosted Supabase project.
 
 ## Status
 
-- Fourteen versioned migrations live in `supabase/migrations/`.
+- Fifteen versioned migrations live in `supabase/migrations/`.
 - `supabase db reset` applies all migrations and `supabase/seed.sql` from an
   empty local database.
-- `supabase test db --local` runs 475 pgTAP assertions across twelve files; all
+- `supabase test db --local` runs 554 pgTAP assertions across thirteen files; all
   pass on a fresh reset.
 - `supabase db lint --local` reports no schema errors.
 - `supabase/schema.sql` is retained as the Phase 1 historical file. The
@@ -32,8 +32,12 @@ deployed to a hosted Supabase project.
   removes multi-monitor deadlocks. Phase 4C.0.2 closes the final review findings:
   trigger-order-independent allowlist immutability, one canonical lock order,
   fail-closed bounded gate cleanup, and deletion/recreation protection for the
-  gate row.
-- Phase 4B/4C.0.2 is **not activated for customers**. The database execution gate
+  gate row. Phase 4C.0.3 closes the independent audit findings: structured
+  cleanup results, explicit fail-closed mode transitions, global and
+  public-schema default-ACL hardening, direct-insert and lease-RPC revocation
+  behavior, `EXISTS` activation checks, internal-helper revocation, and corrected
+  trigger comments.
+- Phase 4B/4C.0.3 is **not activated for customers**. The database execution gate
   is `disabled` by default, the scheduler only queues operator-allowlisted
   fixtures, and the worker refuses `customer` mode. No alert delivery or
   incident automation is added.
@@ -146,6 +150,13 @@ channels, encrypted placeholder secrets, and an alert delivery.
     fail-closed gate disable with bounded `SKIP LOCKED` cleanup, gate DELETE and
     TRUNCATE rejection, fail-closed gate recreation, expanded D-1 permission
     coverage, and cleanup status fields. It does not enable customer execution.
+15. `20261115090000_phase4c03_final_audit_remediation.sql` - Phase 4C.0.3
+    independent audit remediation: JSON cleanup results, explicit
+    fail-closed gate transitions, direct pending/leased insert rejection, lease
+    RPC revocation behavior, global and public-schema default-ACL hardening,
+    `EXISTS` activation checks, explicit internal-helper revocation, and corrected
+    trigger comments. D-2 remains an external hosted blocker. It does not enable
+    customer execution.
 
 ## Entity relationship diagram
 
@@ -545,7 +556,8 @@ unique constraints and restricted functions is simpler to operate and test.
 - A reaper (`onedash_reap_expired_leases`) that returns expired jobs to
   `pending` or dead-letters them when the attempt budget is exhausted. It
   increments `lease_expired_count` and records `lease_expired` as the sanitized
-  error class.
+  error class. When the gate is disabled, missing, or in customer mode, expired
+  leases are dead-lettered instead of requeued.
 
 ### Execution gate and fixture allowlist
 
@@ -562,10 +574,21 @@ unique constraints and restricted functions is simpler to operate and test.
   cleanup epoch (`cleanup_required = true`). It does **not** scan or update job
   rows in the gate transaction. `cleanup_started_at` and `cleanup_completed_at`
   are informational audit fields exposed by `onedash_execution_status()`.
-- The gate cannot be re-enabled, and an enabled non-fixtures mode cannot be
-  entered, while any `pending` or `leased` job remains. Run
-  `public.onedash_dead_letter_all_jobs('blocked_target')` until it returns `0`,
-  then enable fixtures mode.
+- Every mode transition is explicit. Leaving fixtures or customer mode opens an
+  epoch. Entering fixtures or customer mode requires zero pending or leased jobs.
+  Customer mode is unsupported, so it keeps `cleanup_required = true` even when
+  its activation succeeds; the enabled-customer -> enabled-fixtures path
+  therefore cannot bypass cleanup. Same-mode metadata updates never silently open
+  or close an epoch.
+- Operators run `public.onedash_dead_letter_all_jobs('blocked_target')` until the
+  JSON result reports `cleanup_required = false`. The result contains `updated`,
+  `remaining`, and `cleanup_required`. A zero `updated` count only means the
+  remaining rows are locked or unavailable; it is never completion evidence.
+  Keep the gate disabled and retry after releasing the blockers.
+- Pending and leased inserts are rejected with SQLSTATE `55000` unless the gate
+  exists and is enabled fixtures mode. Terminal history inserts remain allowed.
+  Lease extension is refused while the gate is inactive; release, failure, and
+  reaping dead-letter a valid lease instead of recreating pending work.
 - `DELETE` and `TRUNCATE` on the gate table are rejected with SQLSTATE `23514`.
   A missing row is reported as disabled with `cleanup_required = true`. A
   recreated row must start disabled; an INSERT cannot silently reactivate old
@@ -744,15 +767,19 @@ instead of failing the aggregate.
 PUBLIC, `anon`, `authenticated`, and `service_role` on every application
 `SECURITY DEFINER` function, not only PUBLIC. It then regrants only the
 documented public RPC exceptions and worker group functions; trigger helpers and
-internal authorization helpers receive no API or worker grant. It also revokes
-default EXECUTE for future functions created by `postgres` and
-`onedash_function_owner` from those roles. The local `postgres` role is not a
-member of `supabase_admin`, so it cannot alter that superuser's default ACLs or
-revoke grants on functions owned by it. The migration reports this as an
-external production blocker. An operator must run
-`docs/runbooks/supabase-admin-function-acl.md` as `supabase_admin` or a
-superuser, then verify on the hosted project. Do not assume the limitation is
-fixed by the local migration alone.
+internal authorization helpers receive no API or worker grant. Phase 4C.0.3
+harden both the global (`defaclnamespace = 0`) and `public`-schema default
+function ACLs for `postgres` and `onedash_function_owner`, because PostgreSQL
+unions both scopes and a per-schema `REVOKE` cannot cancel a global `GRANT`.
+Internal trigger, dead-letter, maintenance, and validation helpers are
+explicitly revoked from the scheduler, queue, and ingestor groups, while
+scheduler-only heartbeat cleanup and the intended worker RPC grants are
+preserved. The local `postgres` role is not a member of `supabase_admin`, so it
+cannot alter that superuser's default ACLs in either scope or revoke grants on
+functions owned by it. The migration reports this as an external production
+blocker. An operator must run `docs/runbooks/supabase-admin-function-acl.md` as
+`supabase_admin` or a superuser, inspect both scopes, and verify on the hosted
+project. Do not assume the limitation is fixed by the local migration alone.
 
 **Bounded cleanup.** `onedash_cleanup_stale_heartbeats(integer)` is executable
 only by `onedash_scheduler`; `onedash_queue`, `anon`, `authenticated`, and
@@ -823,12 +850,14 @@ alter the default-disabled gate.
 - **E-3 fail-closed bounded cleanup.** Gate disable commits the disabled state
   immediately and opens a cleanup epoch; it does not scan jobs. Operators run
   `onedash_dead_letter_all_jobs('blocked_target')` in fixed 100-row batches until
-  it returns `0`. The function locks the gate first, uses
-  `FOR UPDATE SKIP LOCKED`, runs with `statement_timeout = 5s` and
-  `lock_timeout = 2s`, and never deletes result or job history.
-  `cleanup_required` stays true and gate re-enable is rejected with SQLSTATE
-  `23514` while any pending or leased job remains. A locked row that is skipped
-  keeps the gate closed for the next batch.
+  the structured result reports `cleanup_required = false`. The function locks the
+  gate first, uses `FOR UPDATE SKIP LOCKED`, runs with
+  `statement_timeout = 5s` and `lock_timeout = 2s`, and never deletes result or
+  job history. `cleanup_required` stays true and gate re-enable is rejected with
+  SQLSTATE `23514` while any pending or leased job remains. A locked row that is
+  skipped keeps the gate closed for the next batch. Phase 4C.0.3 replaced the
+  plain integer result with `{updated, remaining, cleanup_required}` so a
+  zero-row batch cannot be mistaken for completion.
 - **E-4 gate deletion and recreation.** A row-level DELETE and a statement-level
   TRUNCATE both raise SQLSTATE `23514`. A missing gate row is reported by
   `onedash_execution_status()` as disabled with `cleanup_required = true`, and
@@ -844,6 +873,59 @@ alter the default-disabled gate.
   hosted-project blocker. The runbook now uses an explicit reviewed function
   inventory rather than revoking every function in the schema. Do not mark D-2
   fixed from a local database.
+
+### Phase 4C.0.3 independent audit remediation
+
+Phase 4C.0.3 is a forward-only migration over Phase 4C.0.2. It does not enable
+customer checks, wire `createRealChecker`, deploy a hosted database, or execute
+the privileged `supabase_admin` runbook. It closes the eight findings from the
+independent audit of commit `4c71a3a`:
+
+- **F1 structured cleanup.** `onedash_dead_letter_all_jobs(text)` returns
+  `jsonb` with `updated`, `remaining`, and `cleanup_required`. The function
+  re-owns under `onedash_function_owner`, revokes every API and worker group, and
+  keeps the gate-first `FOR UPDATE SKIP LOCKED` batch behavior. A zero-row batch
+  with remaining nonterminal work keeps the epoch open and is never completion
+  evidence.
+- **F2 explicit transitions.** The gate trigger defines every mode transition.
+  Disabled -> fixtures requires an empty queue and closes the epoch only after
+  zero pending/leased jobs. Disabled -> customer requires an empty queue but
+  keeps the marker open because customer execution is unsupported.
+  Fixtures/customer -> disabled opens an epoch without scanning rows. Versioned
+  transitions in either direction require zero nonterminal jobs; customer ->
+  fixtures cannot bypass cleanup. Same-mode metadata never silently changes the
+  epoch. The gate INSERT path still forces a disabled, cleanup-required row.
+- **F3 default ACL scopes.** The migration hardens both global
+  (`defaclnamespace = 0`) and `public`-schema default function ACLs for
+  `postgres` and `onedash_function_owner`. PostgreSQL 17 unions both scopes; a
+  per-schema `REVOKE` cannot cancel a global `GRANT`. The migration attempts both
+  scopes for `supabase_admin` and catches `insufficient_privilege`, so D-2
+  remains an external hosted blocker rather than a false local claim. pgTAP
+  checks catalog ACLs, effective permissions on newly created functions, and
+  PUBLIC/anon/authenticated/service_role denials while preserving legitimate
+  grants.
+- **F4 direct-insert and lease revocation.** Pending or leased inserts raise
+  SQLSTATE `55000` unless the gate exists and is enabled fixtures mode. The
+  insert trigger takes the gate `FOR SHARE` before the cap lock and job row.
+  `onedash_extend_lease` returns `execution_disabled` without touching the job
+  when the gate is inactive. Release and failure dead-letter a valid live lease
+  instead of recreating pending work, and the reaper dead-letters expired leases
+  while the gate is inactive. Exact lease-token ownership remains required, and
+  terminal/history inserts remain allowed.
+- **F5 runbook.** `docs/runbooks/supabase-admin-function-acl.md` now covers both
+  default-ACL scopes, PostgreSQL 17/Supabase behavior, `pg_proc.prokind` values
+  `f`/`p`/`a`/`w`, valid `ON ROUTINE`/`ON PROCEDURE` commands, a reviewed
+  privileged procedure, evidence capture, and rollback. D-2 remains unresolved.
+- **F6 EXISTS activation guard.** The activation guard uses an `EXISTS` probe
+  instead of `COUNT(*)`, so it stops at the first nonterminal row and raises the
+  authoritative message
+  `execution gate cleanup is incomplete: pending or leased jobs remain`.
+- **F7 internal helper revocation.** Trigger, dead-letter, maintenance, and
+  validation helpers are explicitly revoked from `onedash_scheduler`,
+  `onedash_queue`, and `onedash_ingestor`. Scheduler-only heartbeat cleanup and
+  the intended worker RPC grants remain unchanged.
+- **F8 stale comments.** The Phase 4C.0.1 migration comments now describe the
+  current bounded cleanup path instead of a transaction-time AFTER trigger.
 
 **Trusted operator transaction rules.** `postgres`, migration owners, and
 members of the operator roles can write tables directly, so they are a trusted
@@ -864,7 +946,7 @@ boundary rather than a security boundary. Their transactions must:
 
 ### Activation prerequisites
 
-Phase 4B/4C.0.2 must not be used to monitor customer URLs. Before customer
+Phase 4B/4C.0.3 must not be used to monitor customer URLs. Before customer
 activation in a later phase:
 
 1. Implement and review the production egress-isolated worker host. The
@@ -952,10 +1034,16 @@ The pgTAP suite is in `supabase/tests/database/`:
   immediate fail-closed disable, ingestion rejection during cleanup,
   re-enable blocking, result and job-history preservation, gate DELETE/TRUNCATE
   rejection, missing-row behavior, and fail-closed recreation.
+- `013_phase4c03_final_audit_remediation.sql` - Phase 4C.0.3 structured cleanup
+  results and zero-row semantics, explicit gate transitions, direct pending and
+  leased insert rejection with SQLSTATE `55000`, missing-gate behavior, lease
+  revocation behavior, `EXISTS` activation checks, global and public-schema
+  default-ACL scopes, effective API-role denials, preserved legitimate grants,
+  internal-helper revocation, and scheduler-only heartbeat cleanup.
 
-The suite currently has **475 assertions across twelve files**.
+The suite currently has **554 assertions across thirteen files**.
 
-Phase 4B/4C.0.2 also has separate multi-connection integration tests:
+Phase 4B/4C.0.3 also has separate multi-connection integration tests:
 `tests/phase4b/database-pipeline.test.ts`,
 `tests/phase4b/residual-security.test.ts`, and
 `tests/phase4b/audit-remediation-concurrency.test.ts`. They are not part of the
@@ -971,9 +1059,10 @@ lease expiry while blocked on the job row, and ingestion rejection/no-write
 behavior. The audit-remediation test adds opposite-order multi-monitor job and
 schedule inserts, mixed schedule-plus-job transactions, gate-disable races
 against claims and scheduling, a canonical cap-before-schedule lock-order test,
-and a 110-job `SKIP LOCKED` cleanup that must finish in more than one bounded
-batch. All use dedicated monitors and clean up their roles and rows. Run them
-with:
+a 110-job `SKIP LOCKED` cleanup that must finish in more than one bounded batch,
+and Phase 4C.0.3 coverage for all-locked independent connections and concurrent
+cleanup/gate transitions in both lock directions. All use dedicated monitors and
+clean up their roles and rows. Run them with:
 
 ```bash
 npm run test:phase4b
@@ -1022,13 +1111,14 @@ test-specific slugs and IDs so seed data does not make counts ambiguous.
 8. **No hosted deployment.** Migrations have not been pushed to a remote
    Supabase project. Do not run `supabase db push` against production without
    review and a backup.
-9. **Phase 4B/4C.0.2 integration coverage is local-only.** The pipeline test
+9. **Phase 4B/4C.0.3 integration coverage is local-only.** The pipeline test
    uses four restricted-role connections, requires a running local Supabase
    database, and creates disposable login roles. The residual test adds
    independent-connection cap races, global cap-lock checks, concurrent
    ingestion, and rejection/no-write assertions. The audit-remediation test adds
    opposite-order multi-monitor inserts, gate-disable races, a canonical
-   cap-before-schedule lock assertion, and multi-batch bounded cleanup. Together
+   cap-before-schedule lock assertion, multi-batch bounded cleanup, all-locked
+   zero-row cleanup, and concurrent cleanup/gate transitions. Together
    they include a worker-runtime end-to-end pass through the restricted queue
    and ingestor clients. They are not hosted, multi-region, or
    failure-injection tests.
@@ -1051,10 +1141,11 @@ test-specific slugs and IDs so seed data does not make counts ambiguous.
     migrated to the split roles.
 15. **The `supabase_admin` default-ACL hardening is not applied locally
     (D-2).** The migration role `postgres` is not a member of the local
-    superuser `supabase_admin`, so it cannot alter that role's default function
-    privileges or revoke grants on functions it owns. The migration emits a
-    notice and the pgTAP suite records the limitation as an external production
-    blocker. A privileged operator must complete
+    superuser `supabase_admin`, so it cannot alter that role's global or
+    `public`-schema default function privileges or revoke grants on functions it
+    owns. The migration attempts both scopes, emits a notice for each scope it
+    cannot change, and the pgTAP suite records the limitation as an external
+    production blocker. A privileged operator must complete
     `docs/runbooks/supabase-admin-function-acl.md` and record hosted
     verification before relying on default-ACL hardening for functions created
     by that role.

@@ -201,9 +201,10 @@ revoke execute on function public.onedash_lock_allowlist_monitor()
 -- ------------------------------------------------------------
 -- Both functions now read the singleton gate with FOR SHARE. The gate disable
 -- path is an UPDATE of the same row, so it cannot commit while a claim or
--- schedule is in progress. Once the disable commits, the AFTER trigger has
--- dead-lettered every pending and leased job. A claim or schedule that wins the
--- race completes first and is then revoked by that trigger.
+-- schedule is in progress. Once the disable commits, it only opens a cleanup
+-- epoch; bounded cleanup dead-letters pending and leased jobs. A claim or
+-- schedule that wins the race completes first and is then revoked by that
+-- cleanup call.
 
 create or replace function public.onedash_schedule_due_jobs(
   p_batch_size integer default 50,
@@ -413,7 +414,8 @@ begin
 
   -- Acquire the gate lock before reading the gate state. A candidate job must
   -- not be leased after a gate disable has taken effect. If this call wins the
-  -- race, the gate disable waits and its AFTER trigger revokes the lease.
+  -- race, the gate disable waits and bounded cleanup revokes the lease after
+  -- this transaction commits.
   select * into v_exec
   from public.monitor_execution_settings
   where singleton
@@ -747,4 +749,4 @@ comment on table public.monitor_execution_allowlist is
   'Operator-managed fixture authorization bound to the exact monitor URL. monitor_id is immutable; moving authorization requires delete/insert so the old monitor revocation trigger fires. Allowlist writes take the monitor lock first; removing a row or changing the monitor URL dead-letters pending and leased jobs.';
 
 comment on table public.monitor_execution_settings is
-  'Singleton execution gate. Disabled by default. Claim and schedule functions hold FOR SHARE on this row while validating it. A transition away from enabled fixtures mode dead-letters every pending and leased job.';
+  'Singleton execution gate. Disabled by default. Claim and schedule functions hold FOR SHARE on this row while validating it. A transition away from enabled fixtures mode opens a bounded cleanup epoch; it does not scan or dead-letter jobs inside the gate transaction.';

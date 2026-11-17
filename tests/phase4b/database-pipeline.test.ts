@@ -144,6 +144,12 @@ type ReleaseResult = {
   reason?: string;
 };
 
+type CleanupResult = {
+  updated: number;
+  remaining: number;
+  cleanup_required: boolean;
+};
+
 async function insertPendingJob(
   monitorId: string,
   key: string,
@@ -188,12 +194,19 @@ async function cleanupBatches(
 ): Promise<number> {
   let total = 0;
   for (let batch = 0; batch < maxBatches; batch += 1) {
-    const result = await client.query<{ count: number }>(
-      "select public.onedash_dead_letter_all_jobs('blocked_target') as count",
+    const result = await client.query<{ result: CleanupResult }>(
+      "select public.onedash_dead_letter_all_jobs('blocked_target') as result",
     );
-    const count = Number(result.rows[0].count);
-    total += count;
-    if (count === 0) return total;
+    const cleanup = result.rows[0].result;
+    total += cleanup.updated;
+    if (!cleanup.cleanup_required) return total;
+    if (cleanup.updated === 0) {
+      // A zero-row batch only means the remaining rows are locked or otherwise
+      // unavailable. It is never completion evidence.
+      throw new Error(
+        `bounded gate cleanup is blocked with ${cleanup.remaining} nonterminal job(s) remaining`,
+      );
+    }
   }
   throw new Error("bounded gate cleanup did not converge");
 }
@@ -1843,8 +1856,8 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
       scheduled: 0,
       execution_mode: "disabled",
     });
-    // Phase 4C.0.2: disable is immediate. It opens a cleanup epoch but does not
-    // scan or dead-letter jobs inside the gate UPDATE transaction.
+    // Phase 4C.0.2/4C.0.3: disable is immediate. It opens a cleanup epoch but
+    // does not scan or dead-letter jobs inside the gate UPDATE transaction.
     const stillPending = await admin!.query(
       "select status::text from public.check_jobs where id = $1",
       [id],
@@ -1854,32 +1867,32 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
     const disabledClaim = await claimFrom(queue!, "customer-gate-disabled", 5);
     expect(disabledClaim.jobs).toHaveLength(0);
 
-    // A direct operator insert while the gate is disabled is still refused by
-    // the claim function; it remains pending rather than being executed.
-    const disabledPendingId = await insertPendingJob(
-      TEST_MONITOR_ID_4,
-      "customer-gate-disabled-pending",
+    // Phase 4C.0.3: a direct operator insert while the gate is disabled is
+    // rejected at the table boundary, not merely ignored by the claim function.
+    await expectPgError(
+      insertPendingJob(TEST_MONITOR_ID_4, "customer-gate-disabled-pending"),
+      "55000",
     );
-    const pendingWhileDisabled = await admin!.query(
-      "select count(*)::int as count from public.check_jobs where id = $1 and status = 'pending'",
-      [disabledPendingId],
+    const rejectedPending = await admin!.query(
+      "select count(*)::int as count from public.check_jobs where idempotency_key = $1",
+      ["customer-gate-disabled-pending"],
     );
-    expect(pendingWhileDisabled.rows[0].count).toBe(1);
+    expect(rejectedPending.rows[0].count).toBe(0);
 
     // Bounded cleanup is what revokes old work. Repeat the operator loop until
-    // it returns zero before attempting to re-enable the gate.
-    expect(await drainGateCleanup(admin!)).toBeGreaterThanOrEqual(2);
+    // cleanup_required is false before attempting to re-enable the gate.
+    expect(await drainGateCleanup(admin!)).toBeGreaterThanOrEqual(1);
     const revokedWhileDisabled = await admin!.query(
       `select count(*)::int as count
        from public.check_jobs
-       where id = any($1::uuid[])
+       where id = $1
          and status = 'dead_letter'
          and lease_owner is null
          and lease_token is null
          and lease_expires_at is null`,
-      [[id, disabledPendingId]],
+      [id],
     );
-    expect(revokedWhileDisabled.rows[0].count).toBe(2);
+    expect(revokedWhileDisabled.rows[0].count).toBe(1);
 
     await admin!.query(
       `update public.monitor_execution_settings
@@ -1905,7 +1918,7 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
 
     const revokedWhileCustomer = await admin!.query(
       "select status::text from public.check_jobs where id = $1",
-      [disabledPendingId],
+      [id],
     );
     expect(revokedWhileCustomer.rows[0].status).toBe("dead_letter");
 

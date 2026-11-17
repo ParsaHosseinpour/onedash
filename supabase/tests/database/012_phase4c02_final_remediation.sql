@@ -190,10 +190,25 @@ select is(
 -- E-3: bounded batches, re-enable guard, no history deletion
 -- ============================================================
 
+create temporary table onedash_4c02_first_batch on commit drop as
+select public.onedash_dead_letter_all_jobs('blocked_target') as result;
+
 select is(
-  public.onedash_dead_letter_all_jobs('blocked_target'),
-  100,
+  (select result->>'updated' from onedash_4c02_first_batch),
+  '100',
   'the first cleanup call processes exactly one 100-row batch'
+);
+
+select is(
+  (select result->>'remaining' from onedash_4c02_first_batch),
+  '10',
+  'the first cleanup result reports the ten jobs that remain'
+);
+
+select is(
+  (select result->>'cleanup_required' from onedash_4c02_first_batch),
+  'true',
+  'the first cleanup result keeps the epoch open while work remains'
 );
 
 select is(
@@ -230,10 +245,25 @@ select throws_ok(
   'the gate cannot be re-enabled while nonterminal jobs remain'
 );
 
+create temporary table onedash_4c02_second_batch on commit drop as
+select public.onedash_dead_letter_all_jobs('blocked_target') as result;
+
 select is(
-  public.onedash_dead_letter_all_jobs('blocked_target'),
-  10,
+  (select result->>'updated' from onedash_4c02_second_batch),
+  '10',
   'the second cleanup call processes the remaining batch'
+);
+
+select is(
+  (select result->>'remaining' from onedash_4c02_second_batch),
+  '0',
+  'the second cleanup result reports no nonterminal jobs'
+);
+
+select is(
+  (select result->>'cleanup_required' from onedash_4c02_second_batch),
+  'false',
+  'the second cleanup result closes the epoch'
 );
 
 select is(
@@ -271,6 +301,18 @@ select is(
   (select job_count from onedash_4c02_history) + 110,
   (select count(*)::int from public.check_jobs),
   'bounded cleanup keeps every job row as dead-letter history'
+);
+
+select is(
+  public.onedash_dead_letter_all_jobs('blocked_target')->>'updated',
+  '0',
+  'a zero-row cleanup batch reports zero updated jobs'
+);
+
+select is(
+  public.onedash_dead_letter_all_jobs('blocked_target')->>'cleanup_required',
+  'false',
+  'a zero-row cleanup batch is completion only because cleanup_required is false'
 );
 
 select lives_ok(
