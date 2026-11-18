@@ -48,7 +48,10 @@ from (
      'https://4c03-transition-a.acme.test/health'),
     ('4c030000-0000-4000-8000-000000000002'::uuid,
      'Phase 4C.0.3 transition B',
-     'https://4c03-transition-b.acme.test/health')
+     'https://4c03-transition-b.acme.test/health'),
+    ('4c030000-0000-4000-8000-000000000003'::uuid,
+     'Phase 4C.0.3 terminal cap',
+     'https://4c03-terminal-cap.acme.test/health')
 ) as v(id, name, url)
 join public.organizations o on o.slug = 'acme-monitoring';
 
@@ -96,18 +99,33 @@ select throws_ok(
   'a direct leased insert is rejected while the gate is disabled'
 );
 
-select lives_ok(
-  $$
-    insert into public.check_jobs (
-      organization_id, monitor_id, region, scheduled_for, available_at,
-      idempotency_key, status, completed_at, completion_token
-    )
-    select organization_id, id, 'test-1', clock_timestamp(), clock_timestamp(),
-           '4c03-terminal-disabled', 'completed', now(), gen_random_uuid()
-    from public.monitors
-    where id = '4c030000-0000-4000-8000-000000000001'
-  $$,
-  'a terminal history insert is still allowed while the gate is disabled'
+with inserted as (
+  insert into public.check_jobs (
+    organization_id, monitor_id, region, scheduled_for, available_at,
+    idempotency_key, status, completed_at, completion_token
+  )
+  select organization_id, id, 'test-1', clock_timestamp(), clock_timestamp(),
+         '4c03-terminal-disabled', 'completed', now(), gen_random_uuid()
+  from public.monitors
+  where id = '4c030000-0000-4000-8000-000000000001'
+  returning id
+)
+select is(
+  count(*)::int,
+  1,
+  'a terminal history insert returns one row while the gate is disabled'
+)
+from inserted;
+
+select is(
+  (
+    select count(*)::int
+    from public.check_jobs
+    where idempotency_key = '4c03-terminal-disabled'
+      and status = 'completed'
+  ),
+  1,
+  'the terminal history row persists while the gate is disabled'
 );
 
 -- Simulate the documented missing-row state without using it as a supported
@@ -135,18 +153,33 @@ select throws_ok(
   'a direct pending insert is rejected while the gate row is missing'
 );
 
-select lives_ok(
-  $$
-    insert into public.check_jobs (
-      organization_id, monitor_id, region, scheduled_for, available_at,
-      idempotency_key, status, completed_at, completion_token
-    )
-    select organization_id, id, 'test-1', clock_timestamp(), clock_timestamp(),
-           '4c03-terminal-missing-gate', 'completed', now(), gen_random_uuid()
-    from public.monitors
-    where id = '4c030000-0000-4000-8000-000000000001'
-  $$,
-  'a terminal history insert is still allowed while the gate row is missing'
+with inserted as (
+  insert into public.check_jobs (
+    organization_id, monitor_id, region, scheduled_for, available_at,
+    idempotency_key, status, completed_at, completion_token
+  )
+  select organization_id, id, 'test-1', clock_timestamp(), clock_timestamp(),
+         '4c03-terminal-missing-gate', 'completed', now(), gen_random_uuid()
+  from public.monitors
+  where id = '4c030000-0000-4000-8000-000000000001'
+  returning id
+)
+select is(
+  count(*)::int,
+  1,
+  'a terminal history insert returns one row while the gate row is missing'
+)
+from inserted;
+
+select is(
+  (
+    select count(*)::int
+    from public.check_jobs
+    where idempotency_key = '4c03-terminal-missing-gate'
+      and status = 'completed'
+  ),
+  1,
+  'the terminal history row persists while the gate row is missing'
 );
 
 select lives_ok(
@@ -736,6 +769,258 @@ select is(
   )->>'duplicate',
   'true',
   'acknowledgement still accepts the exact completion owner as a duplicate'
+);
+
+-- ============================================================
+-- M-1: terminal history is not suppressed by the ten-job cap
+-- ============================================================
+
+insert into public.check_jobs (
+  organization_id, monitor_id, region, scheduled_for, available_at,
+  idempotency_key, status, lease_owner, lease_token, lease_expires_at
+)
+select
+  m.organization_id,
+  m.id,
+  'test-1',
+  timestamptz '2026-01-04 00:00:00+00' + (g.n || ' seconds')::interval,
+  timestamptz '2026-01-04 00:00:00+00' + (g.n || ' seconds')::interval,
+  '4c03-cap-job-' || g.n,
+  (case when g.n <= 5 then 'pending' else 'leased' end)::public.check_job_status,
+  case when g.n <= 5 then null else 'phase4c03-cap-worker' end,
+  case when g.n <= 5 then null else gen_random_uuid() end,
+  case when g.n <= 5 then null else now() + interval '5 minutes' end
+from public.monitors m
+cross join generate_series(1, 10) as g(n)
+where m.id = '4c030000-0000-4000-8000-000000000003';
+
+select is(
+  (
+    select count(*)::int
+    from public.check_jobs
+    where monitor_id = '4c030000-0000-4000-8000-000000000003'
+      and status in ('pending', 'leased')
+  ),
+  10,
+  'the terminal-history fixture monitor has ten pending and leased jobs'
+);
+
+with inserted as (
+  insert into public.check_jobs (
+    organization_id, monitor_id, region, scheduled_for, available_at,
+    idempotency_key, status, completed_at, completion_token
+  )
+  select organization_id, id, 'test-1',
+         timestamptz '2026-01-04 00:10:00+00',
+         timestamptz '2026-01-04 00:10:00+00',
+         '4c03-cap-terminal-completed', 'completed', now(), gen_random_uuid()
+  from public.monitors
+  where id = '4c030000-0000-4000-8000-000000000003'
+  returning id
+)
+select is(
+  count(*)::int,
+  1,
+  'a completed insert returns one row while the monitor is at the ten-job cap'
+)
+from inserted;
+
+select is(
+  (
+    select count(*)::int
+    from public.check_jobs
+    where idempotency_key = '4c03-cap-terminal-completed'
+      and status = 'completed'
+  ),
+  1,
+  'the completed history row persists while the monitor is at the ten-job cap'
+);
+
+with inserted as (
+  insert into public.check_jobs (
+    organization_id, monitor_id, region, scheduled_for, available_at,
+    idempotency_key, status, dead_letter_at, last_error_class
+  )
+  select organization_id, id, 'test-1',
+         timestamptz '2026-01-04 00:11:00+00',
+         timestamptz '2026-01-04 00:11:00+00',
+         '4c03-cap-terminal-dead-letter', 'dead_letter', now(),
+         'blocked_target'
+  from public.monitors
+  where id = '4c030000-0000-4000-8000-000000000003'
+  returning id
+)
+select is(
+  count(*)::int,
+  1,
+  'a dead-letter insert returns one row while the monitor is at the ten-job cap'
+)
+from inserted;
+
+select is(
+  (
+    select count(*)::int
+    from public.check_jobs
+    where idempotency_key = '4c03-cap-terminal-dead-letter'
+      and status = 'dead_letter'
+  ),
+  1,
+  'the dead-letter history row persists while the monitor is at the ten-job cap'
+);
+
+with inserted as (
+  insert into public.check_jobs (
+    organization_id, monitor_id, region, scheduled_for, available_at,
+    idempotency_key, status
+  )
+  select organization_id, id, 'test-1',
+         timestamptz '2026-01-04 00:12:00+00',
+         timestamptz '2026-01-04 00:12:00+00',
+         '4c03-cap-eleventh-pending', 'pending'
+  from public.monitors
+  where id = '4c030000-0000-4000-8000-000000000003'
+  returning id
+)
+select is(
+  count(*)::int,
+  0,
+  'an eleventh pending insert returns no row at the ten-job cap'
+)
+from inserted;
+
+select is(
+  (
+    select count(*)::int
+    from public.check_jobs
+    where idempotency_key = '4c03-cap-eleventh-pending'
+  ),
+  0,
+  'the suppressed eleventh pending insert persists nothing'
+);
+
+with inserted as (
+  insert into public.check_jobs (
+    organization_id, monitor_id, region, scheduled_for, available_at,
+    idempotency_key, status, lease_owner, lease_token, lease_expires_at
+  )
+  select organization_id, id, 'test-1',
+         timestamptz '2026-01-04 00:13:00+00',
+         timestamptz '2026-01-04 00:13:00+00',
+         '4c03-cap-eleventh-leased', 'leased',
+         'phase4c03-cap-worker', gen_random_uuid(),
+         now() + interval '5 minutes'
+  from public.monitors
+  where id = '4c030000-0000-4000-8000-000000000003'
+  returning id
+)
+select is(
+  count(*)::int,
+  0,
+  'an eleventh leased insert returns no row at the ten-job cap'
+)
+from inserted;
+
+select is(
+  (
+    select count(*)::int
+    from public.check_jobs
+    where idempotency_key = '4c03-cap-eleventh-leased'
+  ),
+  0,
+  'the suppressed eleventh leased insert persists nothing'
+);
+
+update public.monitor_execution_settings
+set mode = 'disabled',
+    execution_enabled = false,
+    reason = 'phase4c03 terminal cap disabled'
+where singleton;
+
+with inserted as (
+  insert into public.check_jobs (
+    organization_id, monitor_id, region, scheduled_for, available_at,
+    idempotency_key, status, completed_at, completion_token
+  )
+  select organization_id, id, 'test-1',
+         timestamptz '2026-01-04 00:14:00+00',
+         timestamptz '2026-01-04 00:14:00+00',
+         '4c03-cap-terminal-disabled', 'completed', now(), gen_random_uuid()
+  from public.monitors
+  where id = '4c030000-0000-4000-8000-000000000003'
+  returning id
+)
+select is(
+  count(*)::int,
+  1,
+  'a terminal insert returns one row while the gate is disabled at the ten-job cap'
+)
+from inserted;
+
+select is(
+  (
+    select count(*)::int
+    from public.check_jobs
+    where idempotency_key = '4c03-cap-terminal-disabled'
+      and status = 'completed'
+  ),
+  1,
+  'the terminal row persists while the gate is disabled at the ten-job cap'
+);
+
+-- Simulate the documented missing-row state without using it as a supported
+-- operator path: disable the guard trigger for this transaction, delete the
+-- row, then insert terminal history before restoring the gate.
+alter table public.monitor_execution_settings
+  disable trigger monitor_execution_settings_guard_write;
+delete from public.monitor_execution_settings where singleton;
+alter table public.monitor_execution_settings
+  enable trigger monitor_execution_settings_guard_write;
+
+with inserted as (
+  insert into public.check_jobs (
+    organization_id, monitor_id, region, scheduled_for, available_at,
+    idempotency_key, status, dead_letter_at, last_error_class
+  )
+  select organization_id, id, 'test-1',
+         timestamptz '2026-01-04 00:15:00+00',
+         timestamptz '2026-01-04 00:15:00+00',
+         '4c03-cap-terminal-missing-gate', 'dead_letter', now(),
+         'blocked_target'
+  from public.monitors
+  where id = '4c030000-0000-4000-8000-000000000003'
+  returning id
+)
+select is(
+  count(*)::int,
+  1,
+  'a terminal insert returns one row while the gate row is missing at the ten-job cap'
+)
+from inserted;
+
+select is(
+  (
+    select count(*)::int
+    from public.check_jobs
+    where idempotency_key = '4c03-cap-terminal-missing-gate'
+      and status = 'dead_letter'
+  ),
+  1,
+  'the terminal row exists while the gate row is missing at the ten-job cap'
+);
+
+insert into public.monitor_execution_settings (
+  singleton, execution_enabled, mode, reason
+)
+values (true, false, 'disabled', 'phase4c03 terminal cap restored disabled');
+
+select is(
+  (
+    select count(*)::int
+    from public.monitor_execution_settings
+    where singleton
+  ),
+  1,
+  'the disabled gate row is restored after the missing-gate terminal insert'
 );
 
 -- ============================================================

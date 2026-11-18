@@ -157,7 +157,7 @@ historical waitlist file; it is retained for reference and must not be applied
 after the migrations. The waitlist migration intentionally changes its grants
 to close the direct anon PostgREST INSERT bypass.
 
-The current suite has **554 pgTAP assertions** across thirteen files:
+The current suite has **570 pgTAP assertions** across thirteen files:
 
 - `001_schema_invariants.sql` — RLS coverage, indexes, constraints, function
   hardening, default privilege removal, and waitlist privileges.
@@ -201,10 +201,11 @@ The current suite has **554 pgTAP assertions** across thirteen files:
   missing-row behavior, and fail-closed recreation.
 - `013_phase4c03_final_audit_remediation.sql` - Phase 4C.0.3 structured cleanup
   JSON and zero-row semantics, explicit gate transitions, direct pending/leased
-  insert rejection, missing-gate behavior, lease revocation, `EXISTS` activation
-  checks, global and public-schema default-ACL scopes, effective API-role denials,
-  preserved legitimate grants, internal-helper revocation, and scheduler-only
-  heartbeat cleanup.
+  insert rejection, terminal-history persistence at the ten-job cap and with a
+  disabled or missing gate, missing-gate behavior, lease revocation, `EXISTS`
+  activation checks, global and public-schema default-ACL scopes, effective
+  API-role denials, preserved legitimate grants, internal-helper revocation, and
+  scheduler-only heartbeat cleanup.
 
 The tests run against the seeded local database. They create their own users
 and organizations inside a transaction and roll back, and they scope assertions
@@ -475,7 +476,8 @@ default-disabled gate, does not enable customer monitoring, and does not wire
   SQLSTATE `55000` unless the gate is enabled fixtures mode. Lease extension is
   refused when the gate is inactive; release, failure, and reaping dead-letter a
   valid lease instead of recreating pending work. The exact lease token is still
-  required.
+  required. Completed and dead-letter history inserts return before the cap lock
+  and count, so they persist even at the ten-job cap.
 - **F5 (runbook):** the `supabase_admin` runbook covers both default-ACL scopes,
   PostgreSQL 17 behavior, routine kinds, valid commands, a reviewed privileged
   procedure, evidence, and rollback. D-2 is still open.
@@ -705,7 +707,7 @@ Verified locally on 2026-11-15 on
 | `npm run worker:build` | Pass |
 | `npm audit --omit=dev` | 0 vulnerabilities |
 | `npm run db:reset` | 15 migrations + seed pass |
-| `npm run db:test` | 554 assertions across 13 files pass |
+| `npm run db:test` | 570 assertions across 13 files pass |
 | `npm run db:lint` | No schema errors |
 | Phase 4C.0.2 catalog checks (read-only, local) | All 35 application `SECURITY DEFINER` functions match the per-role effective ACL matrix; unexpected grantees are absent; `monitor_id` updates return `23514` regardless of trigger order; bounded cleanup finishes in multiple batches; gate `DELETE`/`TRUNCATE` and unsafe re-enable are rejected; the `supabase_admin` limitation is asserted and reported as an external blocker |
 | Phase 4C.0.3 catalog checks (read-only, local) | Cleanup returns `{updated, remaining, cleanup_required}`; a zero-row all-locked batch reports remaining work; every gate mode transition is explicit; pending/leased inserts return `55000`; lease RPCs dead-letter instead of requeuing after revocation; the activation guard uses `EXISTS`; global and public-schema defaults are hardened for `postgres` and `onedash_function_owner`; internal helpers are revoked; the `supabase_admin` global and public scopes remain an external blocker |

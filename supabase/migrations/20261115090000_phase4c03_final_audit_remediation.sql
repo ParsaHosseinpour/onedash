@@ -348,6 +348,13 @@ begin
             hint = 'Only enabled fixtures mode accepts pending or leased jobs. Terminal history rows are still allowed.';
   end if;
 
+  -- Terminal history is not executable work and is not subject to the
+  -- pending/leased cap. Return before the cap lock and count so a full queue can
+  -- never silently suppress a completed or dead-letter row.
+  if new.status not in ('pending', 'leased') then
+    return new;
+  end if;
+
   perform pg_catalog.pg_advisory_xact_lock(
     pg_catalog.hashtextextended('onedash-cap-enforcement', 0)
   );
@@ -367,7 +374,7 @@ end;
 $$;
 
 comment on function public.onedash_guard_check_jobs_insert() is
-  'Rejects pending or leased inserts with SQLSTATE 55000 unless the execution gate exists and is enabled fixtures mode. Terminal history inserts remain allowed. Caps pending plus leased jobs per monitor at ten under the canonical gate share lock -> global cap-enforcement advisory lock -> job row order.';
+  'Rejects pending or leased inserts with SQLSTATE 55000 unless the execution gate exists and is enabled fixtures mode. Caps pending plus leased jobs per monitor at ten under the canonical gate share lock -> global cap-enforcement advisory lock -> job row order. Completed and dead-letter history inserts return before the cap lock and count, so a full pending/leased queue cannot suppress terminal history.';
 
 revoke execute on function public.onedash_guard_check_jobs_insert()
   from public, anon, authenticated, service_role, onedash_worker,
@@ -899,7 +906,7 @@ comment on column public.monitor_execution_settings.cleanup_completed_at is
   'When a cleanup batch last observed zero pending and leased jobs and a fixtures-mode activation closed the epoch. Informational audit state only.';
 
 comment on table public.check_jobs is
-  'Durable Phase 4B/4C job queue. Pending and leased inserts require enabled fixtures mode. Revocation dead-letters pending and leased jobs and clears every lease/completion field. The ten-job cap and five-schedule cap share one transaction-scoped global advisory lock. The canonical order is execution gate, cap lock, schedule row, job row.';
+  'Durable Phase 4B/4C job queue. Pending and leased inserts require enabled fixtures mode. Revocation dead-letters pending and leased jobs and clears every lease/completion field. The ten-job cap and five-schedule cap share one transaction-scoped global advisory lock. Terminal history inserts bypass the cap lock and count. The canonical order is execution gate, cap lock, schedule row, job row.';
 
 comment on table public.monitor_schedules is
   'Per-monitor schedule slots. The five-schedule and ten-job caps share one transaction-scoped global advisory lock, acquired after the execution-gate lock and before schedule rows.';

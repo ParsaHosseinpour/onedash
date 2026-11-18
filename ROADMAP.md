@@ -243,13 +243,14 @@ project was linked, pushed, or modified.
 | Worker build | `npm run worker:build` | Pass |
 | Runtime dependency audit | `npm audit --omit=dev` | 0 vulnerabilities |
 | Migrations from empty | `npm run db:reset` | Pass: 15 migrations + seed |
-| Database/RLS/queue/permission tests | `npm run db:test` | Pass: 13 files, 554 assertions |
+| Database/RLS/queue/permission tests | `npm run db:test` | Pass: 13 files, 570 assertions |
 | Database lint | `npm run db:lint` | Pass: no schema errors |
 
 The Phase 4C.0.3 pgTAP suite adds structured cleanup JSON and zero-row
 semantics, explicit gate transitions including the enabled-customer ->
 enabled-fixtures bypass, direct pending/leased insert rejection with SQLSTATE
-`55000`, missing-gate behavior, lease extension/release/failure/reaping
+`55000`, terminal-history persistence at the ten-job cap and with a disabled or
+missing gate, missing-gate behavior, lease extension/release/failure/reaping
 revocation behavior, exact lease-token ownership, `EXISTS` activation checks,
 global and public-schema default-ACL scopes for `postgres` and
 `onedash_function_owner`, effective API-role denials, preserved legitimate

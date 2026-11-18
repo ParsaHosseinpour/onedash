@@ -14,7 +14,7 @@ claim that the schema has been deployed to a hosted Supabase project.
 - Fifteen versioned migrations live in `supabase/migrations/`.
 - `supabase db reset` applies all migrations and `supabase/seed.sql` from an
   empty local database.
-- `supabase test db --local` runs 554 pgTAP assertions across thirteen files; all
+- `supabase test db --local` runs 570 pgTAP assertions across thirteen files; all
   pass on a fresh reset.
 - `supabase db lint --local` reports no schema errors.
 - `supabase/schema.sql` is retained as the Phase 1 historical file. The
@@ -905,13 +905,15 @@ independent audit of commit `4c71a3a`:
   PUBLIC/anon/authenticated/service_role denials while preserving legitimate
   grants.
 - **F4 direct-insert and lease revocation.** Pending or leased inserts raise
-  SQLSTATE `55000` unless the gate exists and is enabled fixtures mode. The
-  insert trigger takes the gate `FOR SHARE` before the cap lock and job row.
-  `onedash_extend_lease` returns `execution_disabled` without touching the job
-  when the gate is inactive. Release and failure dead-letter a valid live lease
-  instead of recreating pending work, and the reaper dead-letters expired leases
-  while the gate is inactive. Exact lease-token ownership remains required, and
-  terminal/history inserts remain allowed.
+  SQLSTATE `55000` unless the gate exists and is enabled fixtures mode. For
+  those executable rows, the insert trigger takes the gate `FOR SHARE` before
+  the cap lock and job row. `onedash_extend_lease` returns `execution_disabled`
+  without touching the job when the gate is inactive. Release and failure
+  dead-letter a valid live lease instead of recreating pending work, and the
+  reaper dead-letters expired leases while the gate is inactive. Exact
+  lease-token ownership remains required. Completed and dead-letter history
+  inserts return before the cap lock and count, so a monitor with ten pending or
+  leased jobs cannot suppress terminal history.
 - **F5 runbook.** `docs/runbooks/supabase-admin-function-acl.md` now covers both
   default-ACL scopes, PostgreSQL 17/Supabase behavior, `pg_proc.prokind` values
   `f`/`p`/`a`/`w`, valid `ON ROUTINE`/`ON PROCEDURE` commands, a reviewed
@@ -1036,12 +1038,13 @@ The pgTAP suite is in `supabase/tests/database/`:
   rejection, missing-row behavior, and fail-closed recreation.
 - `013_phase4c03_final_audit_remediation.sql` - Phase 4C.0.3 structured cleanup
   results and zero-row semantics, explicit gate transitions, direct pending and
-  leased insert rejection with SQLSTATE `55000`, missing-gate behavior, lease
-  revocation behavior, `EXISTS` activation checks, global and public-schema
+  leased insert rejection with SQLSTATE `55000`, terminal-history persistence at
+  the ten-job cap and with a disabled or missing gate, missing-gate behavior,
+  lease revocation behavior, `EXISTS` activation checks, global and public-schema
   default-ACL scopes, effective API-role denials, preserved legitimate grants,
   internal-helper revocation, and scheduler-only heartbeat cleanup.
 
-The suite currently has **554 assertions across thirteen files**.
+The suite currently has **570 assertions across thirteen files**.
 
 Phase 4B/4C.0.3 also has separate multi-connection integration tests:
 `tests/phase4b/database-pipeline.test.ts`,
