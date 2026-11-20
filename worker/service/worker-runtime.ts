@@ -86,6 +86,8 @@ export type WorkerRuntimeMetrics = {
   releasedTotal: number;
   reapedTotal: number;
   timeoutTotal: number;
+  ingestRejectedTotal: number;
+  lastIngestRejectionReason: string | null;
   checkDurationCount: number;
   checkDurationSumMs: number;
   checkDurationMaxMs: number;
@@ -110,6 +112,26 @@ export type WorkerHealth = {
 };
 
 const LEASE_REAP_BATCH = 20;
+
+/**
+ * Ingestion rejections are terminal for this worker. The database has already
+ * revoked, dead-lettered, completed, or reassigned the job; releasing or failing
+ * it again could interfere with the current owner. The reason vocabulary is
+ * fixed so logs and metrics never contain database or payload text.
+ */
+const TERMINAL_INGEST_REJECTIONS = new Set([
+  "job_not_found",
+  "monitor_not_found",
+  "execution_disabled",
+  "monitor_not_authorized",
+  "lease_mismatch",
+  "lease_mismatch_or_expired",
+  "job_completed_without_result",
+]);
+
+function normalizeIngestRejectionReason(reason: string | null): string {
+  return reason && TERMINAL_INGEST_REJECTIONS.has(reason) ? reason : "unknown";
+}
 
 export class WorkerRuntime {
   private readonly config: WorkerConfig;
@@ -145,6 +167,8 @@ export class WorkerRuntime {
   private releasedTotal = 0;
   private reapedTotal = 0;
   private timeoutTotal = 0;
+  private ingestRejectedTotal = 0;
+  private lastIngestRejectionReason: string | null = null;
 
   private checkDurationCount = 0;
   private checkDurationSumMs = 0;
@@ -260,6 +284,8 @@ export class WorkerRuntime {
       releasedTotal: this.releasedTotal,
       reapedTotal: this.reapedTotal,
       timeoutTotal: this.timeoutTotal,
+      ingestRejectedTotal: this.ingestRejectedTotal,
+      lastIngestRejectionReason: this.lastIngestRejectionReason,
       checkDurationCount: this.checkDurationCount,
       checkDurationSumMs: this.checkDurationSumMs,
       checkDurationMaxMs: this.checkDurationMaxMs,
@@ -510,10 +536,7 @@ export class WorkerRuntime {
       const payload = toIngestPayload(result);
       const ingest = await this.ingestor.ingest(job.jobId, job.leaseToken, payload);
       if (!ingest.ok) {
-        this.logger.warn("ingest_rejected", {
-          jobId: job.jobId,
-          reason: ingest.reason ?? "unknown",
-        });
+        await this.handleIngestRejection(job, ingest);
         return;
       }
 
@@ -564,6 +587,45 @@ export class WorkerRuntime {
       clearInterval(leaseTimer);
       this.jobDeadlines.delete(job.jobId);
     }
+  }
+
+  private async handleIngestRejection(
+    job: ClaimedJob,
+    ingest: IngestResult,
+  ): Promise<void> {
+    const reason = normalizeIngestRejectionReason(ingest.reason);
+    this.ingestRejectedTotal += 1;
+    this.lastIngestRejectionReason = reason;
+
+    // A retryable rejection is only honored for a reason outside the terminal
+    // vocabulary. The database's fail_job function still checks the lease token,
+    // so this can never release or fail another worker's lease.
+    if (ingest.retryable === true && reason === "unknown") {
+      this.logger.warn("ingest_rejected_retryable", {
+        jobId: job.jobId,
+        reason,
+      });
+      await this.failSafely(job, "worker_error", true);
+      return;
+    }
+
+    if (reason === "job_completed_without_result") {
+      this.lastErrorClass = "worker_error";
+      this.logger.error("ingest_inconsistent", {
+        jobId: job.jobId,
+        reason,
+      });
+      return;
+    }
+
+    // Every other rejection is terminal for this worker. Do not release,
+    // retry, or acknowledge: the job is revoked, completed, or owned by
+    // another worker. The database is the final authority on the lease.
+    this.logger.warn("ingest_rejected", {
+      jobId: job.jobId,
+      reason,
+      retryable: false,
+    });
   }
 
   private recordCheckDuration(ms: number): void {

@@ -144,6 +144,12 @@ type ReleaseResult = {
   reason?: string;
 };
 
+type CleanupResult = {
+  updated: number;
+  remaining: number;
+  cleanup_required: boolean;
+};
+
 async function insertPendingJob(
   monitorId: string,
   key: string,
@@ -180,6 +186,38 @@ async function insertPendingJob(
   );
   expect(result.rowCount).toBe(1);
   return result.rows[0].id as string;
+}
+
+async function cleanupBatches(
+  client: Client,
+  maxBatches = 100,
+): Promise<number> {
+  let total = 0;
+  for (let batch = 0; batch < maxBatches; batch += 1) {
+    const result = await client.query<{ result: CleanupResult }>(
+      "select public.onedash_dead_letter_all_jobs('blocked_target') as result",
+    );
+    const cleanup = result.rows[0].result;
+    total += cleanup.updated;
+    if (!cleanup.cleanup_required) return total;
+    if (cleanup.updated === 0) {
+      // A zero-row batch only means the remaining rows are locked or otherwise
+      // unavailable. It is never completion evidence.
+      throw new Error(
+        `bounded gate cleanup is blocked with ${cleanup.remaining} nonterminal job(s) remaining`,
+      );
+    }
+  }
+  throw new Error("bounded gate cleanup did not converge");
+}
+
+async function drainGateCleanup(client: Client): Promise<number> {
+  await client.query(
+    `update public.monitor_execution_settings
+     set execution_enabled = false, mode = 'disabled', reason = 'phase4b test cleanup'
+     where singleton`,
+  );
+  return cleanupBatches(client);
 }
 
 async function claimFrom(
@@ -418,6 +456,10 @@ beforeAll(async () => {
     "select * from public.monitor_execution_settings where singleton",
   );
   originalSettings = settings.rows[0] ?? null;
+  // Start from a clean gate. Disabling first lets any nonterminal row left by
+  // an interrupted prior run drain in bounded batches before fixtures mode is
+  // enabled.
+  await drainGateCleanup(admin);
   await admin.query(
     `update public.monitor_execution_settings
      set mode = 'fixtures',
@@ -481,6 +523,10 @@ afterAll(async () => {
   };
 
   try {
+    await runCleanup("drain gate cleanup", async (client) => {
+      await drainGateCleanup(client);
+    });
+
     await runCleanup("restore execution settings", async (client) => {
       if (!originalSettings) return;
       await client.query(
@@ -1043,6 +1089,10 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
     );
     expect(disabledClaim.jobs).toHaveLength(0);
     expect(disabledClaim.execution_mode).toBe("disabled");
+
+    // Phase 4C.0.2: disable is immediate and leaves nonterminal work for the
+    // bounded cleanup loop. Drain it before any reactivation attempt.
+    await drainGateCleanup(admin!);
 
     await admin!.query(
       `update public.monitor_execution_settings
@@ -1806,14 +1856,43 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
       scheduled: 0,
       execution_mode: "disabled",
     });
+    // Phase 4C.0.2/4C.0.3: disable is immediate. It opens a cleanup epoch but
+    // does not scan or dead-letter jobs inside the gate UPDATE transaction.
+    const stillPending = await admin!.query(
+      "select status::text from public.check_jobs where id = $1",
+      [id],
+    );
+    expect(stillPending.rows[0].status).toBe("pending");
+
     const disabledClaim = await claimFrom(queue!, "customer-gate-disabled", 5);
     expect(disabledClaim.jobs).toHaveLength(0);
 
-    const pendingWhileDisabled = await admin!.query(
-      "select count(*)::int as count from public.check_jobs where id = $1 and status = 'pending'",
+    // Phase 4C.0.3: a direct operator insert while the gate is disabled is
+    // rejected at the table boundary, not merely ignored by the claim function.
+    await expectPgError(
+      insertPendingJob(TEST_MONITOR_ID_4, "customer-gate-disabled-pending"),
+      "55000",
+    );
+    const rejectedPending = await admin!.query(
+      "select count(*)::int as count from public.check_jobs where idempotency_key = $1",
+      ["customer-gate-disabled-pending"],
+    );
+    expect(rejectedPending.rows[0].count).toBe(0);
+
+    // Bounded cleanup is what revokes old work. Repeat the operator loop until
+    // cleanup_required is false before attempting to re-enable the gate.
+    expect(await drainGateCleanup(admin!)).toBeGreaterThanOrEqual(1);
+    const revokedWhileDisabled = await admin!.query(
+      `select count(*)::int as count
+       from public.check_jobs
+       where id = $1
+         and status = 'dead_letter'
+         and lease_owner is null
+         and lease_token is null
+         and lease_expires_at is null`,
       [id],
     );
-    expect(pendingWhileDisabled.rows[0].count).toBe(1);
+    expect(revokedWhileDisabled.rows[0].count).toBe(1);
 
     await admin!.query(
       `update public.monitor_execution_settings
@@ -1837,11 +1916,11 @@ describe("Phase 4B scheduler, queue, and ingestion", () => {
     const customerClaim = await claimFrom(queue!, "customer-gate-customer", 5);
     expect(customerClaim.jobs).toHaveLength(0);
 
-    const pendingWhileCustomer = await admin!.query(
-      "select count(*)::int as count from public.check_jobs where id = $1 and status = 'pending'",
+    const revokedWhileCustomer = await admin!.query(
+      "select status::text from public.check_jobs where id = $1",
       [id],
     );
-    expect(pendingWhileCustomer.rows[0].count).toBe(1);
+    expect(revokedWhileCustomer.rows[0].status).toBe("dead_letter");
 
     await admin!.query(
       `update public.monitor_execution_settings

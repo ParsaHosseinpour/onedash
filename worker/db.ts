@@ -5,8 +5,19 @@ export type DbPoolOptions = {
   ssl: boolean;
   applicationName: string;
   max?: number;
+  statementTimeoutMs?: number;
+  lockTimeoutMs?: number;
+  idleInTransactionTimeoutMs?: number;
   onError?: (error: unknown) => void;
 };
+
+// Every worker-side connection is bounded. The database also enforces tighter
+// timeouts on the cleanup function itself; these values protect every other
+// scheduler, queue, ingestor, and health query from a stuck lock or an
+// abandoned transaction.
+const DEFAULT_STATEMENT_TIMEOUT_MS = 15_000;
+const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
+const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = 10_000;
 
 export function createDbPool(options: DbPoolOptions): Pool {
   const config: PoolConfig = {
@@ -15,6 +26,12 @@ export function createDbPool(options: DbPoolOptions): Pool {
     max: options.max ?? 2,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
+    statement_timeout:
+      options.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS,
+    lock_timeout: options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
+    idle_in_transaction_session_timeout:
+      options.idleInTransactionTimeoutMs ??
+      DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
     ssl: options.ssl ? { rejectUnauthorized: true } : undefined,
   };
 

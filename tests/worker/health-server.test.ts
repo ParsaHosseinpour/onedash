@@ -102,6 +102,7 @@ class FakeIngestor implements WorkerIngestor {
       resultId: "result-1",
       monitorStatus: "up",
       reason: null,
+      retryable: null,
     };
   }
   async ping(): Promise<void> {
